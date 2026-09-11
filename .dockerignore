@@ -1,0 +1,10 @@
+.git
+.gitignore
+workbuddy-helper.exe
+workbuddy-helper-linux
+test-data/
+smoke-data/
+*.zip
+outputs/
+README.md
+docker-compose.yml

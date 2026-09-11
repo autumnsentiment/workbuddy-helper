@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="theme-color" content="#f5f7f7" />
+    <title>WorkBuddy 账户助手</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script defer src="/lucide.min.js"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <a class="brand" href="#accounts" aria-label="WorkBuddy 账户助手">
+          <span class="brand-mark" aria-hidden="true">W</span>
+          <span class="brand-copy">
+            <strong>WorkBuddy</strong>
+            <span>账户助手</span>
+          </span>
+        </a>
+
+        <div class="header-actions">
+          <div class="connection-status" id="connection-status" role="status" aria-live="polite">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="connection-label">正在连接</span>
+          </div>
+          <button class="icon-button" id="open-logs" type="button" aria-label="查看运行日志" data-tooltip="运行日志">
+            <i data-lucide="scroll-text" aria-hidden="true"></i>
+          </button>
+          <button class="icon-button" id="refresh-state" type="button" aria-label="刷新账户状态" data-tooltip="刷新">
+            <i data-lucide="refresh-cw" aria-hidden="true"></i>
+          </button>
+          <button class="button button-primary" id="add-account" type="button">
+            <i data-lucide="user-plus" aria-hidden="true"></i>
+            <span>添加账户</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="main-content" id="accounts">
+        <section class="page-heading" aria-labelledby="page-title">
+          <div>
+            <h1 id="page-title">账户</h1>
+            <p id="last-updated">等待首次同步</p>
+          </div>
+          <button class="button button-secondary" id="run-all" type="button">
+            <i data-lucide="calendar-check-2" aria-hidden="true"></i>
+            <span>全部签到</span>
+          </button>
+        </section>
+
+        <section class="summary-grid" aria-label="账户概览">
+          <article class="summary-item">
+            <div class="summary-icon summary-icon-neutral"><i data-lucide="users" aria-hidden="true"></i></div>
+            <div>
+              <span class="summary-label">账户总数</span>
+              <strong class="summary-value" id="summary-total">--</strong>
+            </div>
+          </article>
+          <article class="summary-item">
+            <div class="summary-icon summary-icon-green"><i data-lucide="circle-check-big" aria-hidden="true"></i></div>
+            <div>
+              <span class="summary-label">今日已签到</span>
+              <strong class="summary-value" id="summary-checked">--</strong>
+            </div>
+          </article>
+          <article class="summary-item">
+            <div class="summary-icon summary-icon-amber"><i data-lucide="sparkles" aria-hidden="true"></i></div>
+            <div>
+              <span class="summary-label">总积分</span>
+              <strong class="summary-value" id="summary-points">--</strong>
+            </div>
+          </article>
+          <article class="summary-item">
+            <div class="summary-icon summary-icon-blue"><i data-lucide="power" aria-hidden="true"></i></div>
+            <div>
+              <span class="summary-label">已启用</span>
+              <strong class="summary-value" id="summary-enabled">--</strong>
+            </div>
+          </article>
+        </section>
+
+        <div class="workspace-grid">
+          <section class="accounts-section" aria-labelledby="accounts-title">
+            <div class="section-toolbar">
+              <div>
+                <h2 id="accounts-title">账户列表</h2>
+                <span id="account-count">0 个账户</span>
+              </div>
+              <div class="filter-controls">
+                <label class="search-field" for="account-search">
+                  <i data-lucide="search" aria-hidden="true"></i>
+                  <input id="account-search" type="search" placeholder="搜索账户" autocomplete="off" />
+                </label>
+                <label class="select-field" for="status-filter">
+                  <span class="sr-only">筛选账户状态</span>
+                  <select id="status-filter">
+                    <option value="all">全部状态</option>
+                    <option value="enabled">已启用</option>
+                    <option value="disabled">已停用</option>
+                    <option value="attention">需处理</option>
+                  </select>
+                  <i data-lucide="chevron-down" aria-hidden="true"></i>
+                </label>
+              </div>
+            </div>
+
+            <div class="table-frame" id="account-table-frame" aria-live="polite">
+              <table class="account-table">
+                <thead>
+                  <tr>
+                    <th scope="col">账户</th>
+                    <th scope="col">状态</th>
+                    <th scope="col">今日签到</th>
+                    <th scope="col">积分</th>
+                    <th scope="col">启用</th>
+                    <th class="actions-column" scope="col">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="account-rows"></tbody>
+              </table>
+              <div class="table-state" id="table-state">
+                <div class="loading-spinner" aria-hidden="true"></div>
+                <strong>正在读取账户</strong>
+                <span>请稍候</span>
+              </div>
+            </div>
+          </section>
+
+          <aside class="settings-panel" aria-labelledby="schedule-title">
+            <div class="settings-heading">
+              <div class="settings-icon"><i data-lucide="clock-3" aria-hidden="true"></i></div>
+              <div>
+                <h2 id="schedule-title">自动签到</h2>
+                <p id="schedule-summary">尚未读取设置</p>
+              </div>
+            </div>
+
+            <form id="schedule-form">
+              <div class="form-row switch-row">
+                <div>
+                  <label for="schedule-enabled">启用每日任务</label>
+                <p>按北京时间执行全部账户签到</p>
+                </div>
+                <label class="switch">
+                  <input id="schedule-enabled" name="scheduleEnabled" type="checkbox" />
+                  <span aria-hidden="true"></span>
+                </label>
+              </div>
+
+              <div class="form-row">
+                <label for="schedule-time">执行时间</label>
+                <div class="time-input-wrap">
+                  <i data-lucide="clock" aria-hidden="true"></i>
+                  <input id="schedule-time" name="scheduleTime" type="time" value="09:15" required />
+                </div>
+              </div>
+
+              <button class="button button-secondary button-full" id="save-schedule" type="submit">
+                <i data-lucide="save" aria-hidden="true"></i>
+                <span>保存设置</span>
+              </button>
+            </form>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+    <aside class="log-drawer" id="log-drawer" aria-labelledby="log-title" aria-hidden="true">
+      <div class="drawer-header">
+        <div>
+          <h2 id="log-title">运行日志</h2>
+          <p id="log-subtitle">最近记录</p>
+        </div>
+        <div class="drawer-actions">
+          <button class="icon-button" id="refresh-logs" type="button" aria-label="刷新日志" data-tooltip="刷新日志">
+            <i data-lucide="refresh-cw" aria-hidden="true"></i>
+          </button>
+          <button class="icon-button" id="close-logs" type="button" aria-label="关闭日志" data-tooltip="关闭">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+      </div>
+      <div class="log-list" id="log-list">
+        <div class="drawer-loading">
+          <div class="loading-spinner" aria-hidden="true"></div>
+          <span>正在读取日志</span>
+        </div>
+      </div>
+    </aside>
+
+    <dialog class="modal" id="login-dialog" aria-labelledby="login-title">
+      <form method="dialog" class="modal-card" id="login-form">
+        <div class="modal-header">
+          <div class="modal-icon"><i data-lucide="log-in" aria-hidden="true"></i></div>
+          <div>
+            <h2 id="login-title">添加 WorkBuddy 账户</h2>
+            <p>在腾讯登录页完成授权后，账户会自动加入列表。</p>
+          </div>
+          <button class="icon-button modal-close" value="cancel" type="submit" aria-label="关闭登录窗口" data-tooltip="关闭">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+
+        <div class="login-stage" id="login-starting">
+          <div class="loading-spinner loading-spinner-large" aria-hidden="true"></div>
+          <strong>正在创建登录会话</strong>
+          <span>请稍候</span>
+        </div>
+
+        <div class="login-stage" id="login-ready" hidden>
+          <div class="login-link-panel">
+            <i data-lucide="external-link" aria-hidden="true"></i>
+            <div>
+              <strong>登录链接已准备好</strong>
+              <span id="login-url-label">请在浏览器中打开</span>
+            </div>
+          </div>
+          <a class="button button-primary button-full" id="open-login-link" href="#" target="_blank" rel="noopener noreferrer">
+            <i data-lucide="square-arrow-out-up-right" aria-hidden="true"></i>
+            <span>打开腾讯登录页</span>
+          </a>
+          <button class="button button-quiet button-full" id="copy-login-link" type="button">
+            <i data-lucide="copy" aria-hidden="true"></i>
+            <span>复制登录链接</span>
+          </button>
+          <div class="poll-status" id="login-poll-status" role="status" aria-live="polite">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            <span>等待登录完成</span>
+          </div>
+        </div>
+
+        <div class="login-stage login-error" id="login-error" hidden>
+          <i data-lucide="circle-alert" aria-hidden="true"></i>
+          <strong>登录会话创建失败</strong>
+          <span id="login-error-message">请稍后重试</span>
+          <button class="button button-secondary" id="retry-login" type="button">
+            <i data-lucide="rotate-cw" aria-hidden="true"></i>
+            <span>重试</span>
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog class="modal modal-small" id="edit-dialog" aria-labelledby="edit-title">
+      <form class="modal-card" id="edit-form">
+        <div class="modal-header">
+          <div class="modal-icon"><i data-lucide="pencil" aria-hidden="true"></i></div>
+          <div>
+            <h2 id="edit-title">修改账户名称</h2>
+            <p id="edit-account-id">账户</p>
+          </div>
+          <button class="icon-button modal-close" id="close-edit" type="button" aria-label="关闭编辑窗口" data-tooltip="关闭">
+            <i data-lucide="x" aria-hidden="true"></i>
+          </button>
+        </div>
+        <label class="field-label" for="nickname-input">显示名称</label>
+        <input class="text-input" id="nickname-input" name="nickname" type="text" maxlength="40" placeholder="输入便于识别的名称" autocomplete="off" />
+        <div class="modal-footer">
+          <button class="button button-quiet" id="cancel-edit" type="button">取消</button>
+          <button class="button button-primary" id="save-nickname" type="submit">
+            <i data-lucide="check" aria-hidden="true"></i>
+            <span>保存</span>
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <noscript>
+      <div class="noscript-message">此页面需要启用 JavaScript。</div>
+    </noscript>
+  </body>
+</html>

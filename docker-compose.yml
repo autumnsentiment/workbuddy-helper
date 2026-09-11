@@ -1,0 +1,25 @@
+services:
+  workbuddy-helper:
+    build: .
+    image: workbuddy-helper:latest
+    container_name: workbuddy-helper
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      # 默认只监听容器内 127.0.0.1。需要从宿主机访问界面时改为 0.0.0.0，
+      # 并务必只在受信任的内网使用（界面无登录口令，依赖端口访问控制）。
+      - WBH_HOST=127.0.0.1
+      - WBH_DATA=/data
+    # 把宿主机本地的可移植账号目录挂载到 /data（含 key.bin + state.bin）。
+    # 若目录为空，容器会生成新的空数据目录，之后通过界面添加账号。
+    volumes:
+      - ./data:/data
+    # 只映射到回环地址，容器外无法直接访问。需要远程访问时改用 "18080:18080"。
+    ports:
+      - "127.0.0.1:18080:18080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:18080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
