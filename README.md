@@ -10,6 +10,7 @@
 
 - [功能特性](#功能特性)
 - [界面预览](#界面预览)
+- [下载免安装版（Windows）](#下载免安装版windows)
 - [快速开始（Windows）](#快速开始windows)
 - [Docker 部署](#docker-部署)
 - [命令行选项](#命令行选项)
@@ -47,15 +48,38 @@
 
 ---
 
+## 下载免安装版（Windows）
+
+不想自己编译的话，直接到 Releases 下载单文件程序：
+
+| 文件 | 说明 |
+|---|---|
+| [`WorkBuddyHelper-windows-amd64.exe`](https://github.com/autumnsentiment/workbuddy-helper/releases/latest) | Windows 64 位免安装单文件，双击即用，无需 Go 或任何运行库 |
+| `SHA256SUMS.txt` | 校验值，用于确认下载文件未被篡改 |
+
+```powershell
+# 下载后校验完整性（应与 SHA256SUMS.txt 中的值一致）
+certutil -hashfile WorkBuddyHelper-windows-amd64.exe SHA256
+```
+
+> ✅ **发布包不含任何账号数据。** 二进制是纯程序本体，没有任何令牌、账号或密钥。
+> 首次运行会在数据目录创建**空的**存储，你需要自己通过腾讯官方登录页添加账号。
+> 想自行确认的话，启动后打开看板即可看到账号数为 0。
+
+---
+
 ## 快速开始（Windows）
 
-1. 下载 `WorkBuddyHelper.exe` 并双击运行。程序会启动一个**仅监听 `127.0.0.1`** 的本地服务，并自动打开浏览器。
+1. 下载 [`WorkBuddyHelper-windows-amd64.exe`](https://github.com/autumnsentiment/workbuddy-helper/releases/latest)（或自行[从源码构建](#从源码构建)）并双击运行。程序会启动一个**仅监听 `127.0.0.1`** 的本地服务，并自动打开浏览器。
 2. 点击「添加账户」，在腾讯官方登录页完成登录/授权（验证码、设备验证等由你本人处理）。
 3. 回到看板，点击单账号「签到」或顶部「全部签到」。
 4. 在账号行点击「积分」按钮刷新余额。
 5. 需要每日自动执行时，在右侧打开「自动签到」并设置北京时间。
 
 默认数据目录：`%LOCALAPPDATA%\WorkBuddyHelper`
+
+> 使用 `--host 0.0.0.0` 可让局域网内其他设备访问看板，请仅在可信网络下使用，
+> 详见 [端口与访问控制](#3-端口与访问控制)。
 
 ---
 
