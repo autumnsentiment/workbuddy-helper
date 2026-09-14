@@ -177,6 +177,13 @@
                 <p class="field-hint">每日对话使用该模型发起会话</p>
               </div>
 
+              <div class="form-row" id="active-prompt-row" hidden>
+                <label for="active-prompt">活跃提示词</label>
+                <textarea class="text-input active-prompt-input" id="active-prompt" rows="3" maxlength="200"
+                  placeholder="留空使用默认：你是谁，谁开发你的，现在是什么时间，什么天气" autocomplete="off"></textarea>
+                <p class="field-hint">每次活跃会话发送的自定义消息；过短问候（如 hi）可能被判定为非有效会话，建议使用自然的多句提问</p>
+              </div>
+
               <div class="form-row" id="recheck-delay-row" hidden>
                 <label for="recheck-delay">积分复核延迟（分钟）</label>
                 <input class="text-input" id="recheck-delay" name="recheckDelayMinutes" type="number" min="5" max="720" step="5" value="60" />

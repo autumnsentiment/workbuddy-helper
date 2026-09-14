@@ -1764,3 +1764,12 @@ select:disabled {
 .proxy-input-row .text-input {
   width: 100%;
 }
+
+.active-prompt-input {
+  width: 100%;
+  min-height: 72px;
+  padding: 8px 10px;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.5;
+}

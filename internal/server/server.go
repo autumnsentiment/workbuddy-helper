@@ -290,7 +290,8 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 	case "checkin":
 		account, err = s.service.Checkin(id)
 	case "active":
-		account, err = s.service.ActiveChat(id)
+		// 手动触发视为强制：用户主动点击即真实发送（绕过"今日已活跃"跳过）
+		account, err = s.service.ActiveChat(id, true)
 	case "points":
 		account, err = s.service.Points(id)
 	default:

@@ -369,6 +369,7 @@ func (s *Service) UpdateSettings(settings model.Settings) error {
 	s.state.Settings.ActiveModel = activeModel
 	s.state.Settings.RecheckDelayMinutes = delay
 	s.state.Settings.ProxyURL = proxyURL
+	s.state.Settings.ActivePrompt = strings.TrimSpace(settings.ActivePrompt)
 	if err := s.saveLocked(); err != nil {
 		return err
 	}
@@ -430,6 +431,13 @@ func (s *Service) accountVersion(a model.Account) string {
 		return model.ModeIntl
 	}
 	return model.ModeCN
+}
+
+// activePrompt 国际版活跃会话提示词；空串由 client 层兜底为默认提问
+func (s *Service) activePrompt() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return strings.TrimSpace(s.state.Settings.ActivePrompt)
 }
 
 func (s *Service) recheckDelay() time.Duration {
@@ -599,7 +607,8 @@ func versionForDomain(domain string) string {
 
 // ActiveChat 国际版活跃流程：以客户端特征发送一次对话（hy3/hy4-preview），
 // 使账号被认定为当日活跃；积分非即时到账，按设置延迟排期复核并记录到账变化。
-func (s *Service) ActiveChat(id string) (model.PublicAccount, error) {
+// force=true 跳过"今日已活跃"幂等（手动重发，用于验证请求链路）。
+func (s *Service) ActiveChat(id string, force bool) (model.PublicAccount, error) {
 	lock := s.accountLock(id)
 	lock.Lock()
 	defer lock.Unlock()
@@ -607,7 +616,7 @@ func (s *Service) ActiveChat(id string) (model.PublicAccount, error) {
 	if err != nil {
 		return a.Public(), err
 	}
-	if a.LastActiveDate == today() && a.LastActive == "confirmed" {
+	if !force && a.LastActiveDate == today() && a.LastActive == "confirmed" {
 		s.markStatus(id, a.LastActive, "今日已活跃，跳过重复对话")
 		_ = s.refreshPoints(id, a)
 		updated, _ := s.getAccount(id)
@@ -616,10 +625,10 @@ func (s *Service) ActiveChat(id string) (model.PublicAccount, error) {
 	s.markStatus(id, "running", "正在发送活跃会话")
 	// 先刷新一次积分作为基线，供延迟复核对比到账变化
 	_ = s.refreshPoints(id, a)
-	err = s.apiclient().ActiveChat(&a, s.activeModel())
+	err = s.apiclient().ActiveChat(&a, s.activeModel(), s.activePrompt())
 	if client.IsKind(err, client.KindAuthDead) {
 		if refreshErr := s.refreshAccount(id, &a); refreshErr == nil {
-			err = s.apiclient().ActiveChat(&a, s.activeModel())
+			err = s.apiclient().ActiveChat(&a, s.activeModel(), s.activePrompt())
 		} else {
 			return a.Public(), refreshErr
 		}
@@ -643,7 +652,14 @@ func (s *Service) ActiveChat(id string) (model.PublicAccount, error) {
 	}); err != nil {
 		return a.Public(), err
 	}
-	s.appendLog("info", id, fmt.Sprintf("活跃会话已发送（模型 %s），%d 分钟后自动复核积分到账", s.activeModel(), int(delay.Minutes())))
+	promptDesc := s.activePrompt()
+	if promptDesc == "" {
+		promptDesc = client.DefaultActivePrompt
+	}
+	if r := []rune(promptDesc); len(r) > 18 {
+		promptDesc = string(r[:18]) + "…"
+	}
+	s.appendLog("info", id, fmt.Sprintf("活跃会话已发送（模型 %s，提示词「%s」），%d 分钟后自动复核积分到账", s.activeModel(), promptDesc, int(delay.Minutes())))
 	updated, _ := s.getAccount(id)
 	return updated.Public(), nil
 }
@@ -711,7 +727,7 @@ func (s *Service) RunAll() []model.PublicAccount {
 		var account model.PublicAccount
 		var err error
 		if mode == model.ModeIntl {
-			account, err = s.ActiveChat(id)
+			account, err = s.ActiveChat(id, false)
 		} else {
 			account, err = s.Checkin(id)
 		}

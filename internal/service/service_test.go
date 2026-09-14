@@ -168,7 +168,7 @@ func TestActiveChatSchedulesPointsRecheck(t *testing.T) {
 	})
 	defer closeUpstream()
 
-	account, err := svc.ActiveChat("a1")
+	account, err := svc.ActiveChat("a1", false)
 	if err != nil {
 		t.Fatal(err)
 	}

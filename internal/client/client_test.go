@@ -92,7 +92,7 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 		gotBody = string(raw)
 		return response(200, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"), nil
 	})
-	err := c.ActiveChat(&model.Account{AccessToken: "at", UID: "u1", Domain: "workbuddy.ai"}, "hy4-preview")
+	err := c.ActiveChat(&model.Account{AccessToken: "at", UID: "u1", Domain: "workbuddy.ai"}, "hy4-preview", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +113,22 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, `"stream":true`) || !strings.Contains(gotBody, `"model":"hy4-preview"`) {
 		t.Fatalf("body=%s", gotBody)
+	}
+	if !strings.Contains(gotBody, DefaultActivePrompt) {
+		t.Fatalf("默认提示词缺失: %s", gotBody)
+	}
+	// 默认提示词即实质提问（单字问候会被服务端判为非有效会话）
+	if !strings.Contains(DefaultActivePrompt, "你是谁") {
+		t.Fatalf("默认提示词应为实质提问: %q", DefaultActivePrompt)
+	}
+	// 自定义提示词覆盖
+	gotBody = ""
+	err = c.ActiveChat(&model.Account{AccessToken: "at", UID: "u1", Domain: "workbuddy.ai"}, "hy3", "自定义测试提问")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotBody, "自定义测试提问") || strings.Contains(gotBody, DefaultActivePrompt) {
+		t.Fatalf("自定义提示词未生效: %s", gotBody)
 	}
 }
 

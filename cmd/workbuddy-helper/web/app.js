@@ -37,6 +37,8 @@
     pageTitle: document.querySelector("#page-title"),
     activeModel: document.querySelector("#active-model"),
     activeModelRow: document.querySelector("#active-model-row"),
+    activePrompt: document.querySelector("#active-prompt"),
+    activePromptRow: document.querySelector("#active-prompt-row"),
     recheckDelay: document.querySelector("#recheck-delay"),
     recheckDelayRow: document.querySelector("#recheck-delay-row"),
     colDaily: document.querySelector("#col-daily"),
@@ -79,6 +81,7 @@
       activeModel: "hy3",
       recheckDelayMinutes: 60,
       proxyUrl: "",
+      activePrompt: "",
     },
     isLoading: true,
     loadError: "",
@@ -313,6 +316,7 @@
           : "hy3",
         recheckDelayMinutes: clampRecheckDelay(parseNumber(rawSettings.recheckDelayMinutes) ?? 60),
         proxyUrl: String(firstDefined(rawSettings.proxyUrl, source.proxyUrl, "") || ""),
+        activePrompt: String(firstDefined(rawSettings.activePrompt, source.activePrompt, "") || ""),
       },
     };
   }
@@ -594,6 +598,7 @@
       : "当前已关闭";
     elements.versionMode.value = app.settings.mode;
     elements.activeModel.value = app.settings.activeModel;
+    elements.activePrompt.value = app.settings.activePrompt || "";
     elements.recheckDelay.value = String(app.settings.recheckDelayMinutes);
     const proxy = parseProxyURL(app.settings.proxyUrl);
     elements.proxyScheme.value = proxy.scheme;
@@ -602,7 +607,9 @@
       ? "host:port（支持认证 user:pass@host:port）"
       : "选择协议后填写网关地址:端口（如 192.168.5.1:1070）";
     elements.activeModelRow.hidden = !intl;
+    elements.activePromptRow.hidden = !intl;
     elements.recheckDelayRow.hidden = !intl;
+    if (!intl) elements.activePrompt.value = app.settings.activePrompt || "";
     // 按钮文案跟随当前查看的版本列表（签到=国内列表 / 活跃=国际列表）
     elements.runAllLabel.textContent = viewIntl ? "全部活跃" : "全部签到";
     if (elements.colDaily) elements.colDaily.textContent = intl ? "今日活跃" : "今日签到";
@@ -802,14 +809,15 @@
     const activeModel = ["hy3", "hy4-preview"].includes(elements.activeModel.value) ? elements.activeModel.value : "hy3";
     const recheckDelayMinutes = clampRecheckDelay(parseNumber(elements.recheckDelay.value) ?? 60);
     const proxyUrl = joinProxyURL(elements.proxyScheme.value, elements.proxyHost.value);
+    const activePrompt = elements.activePrompt.value.trim().slice(0, 200);
     setButtonBusy(elements.saveSchedule, true, "保存中");
 
     try {
       const result = await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl }),
+        body: JSON.stringify({ scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl, activePrompt }),
       });
-      app.settings = { scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl };
+      app.settings = { scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl, activePrompt };
       renderSchedule();
       renderAll();
       toast(result?.message || "设置已保存");

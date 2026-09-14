@@ -94,6 +94,9 @@ type Settings struct {
 	// ProxyURL 自定义代理：支持 http:// https:// socks5:// socks5h://（含认证 user:pass@host:port）
 	// 为空直连；作用于全部上游请求（国内版与国际版域名均适用）
 	ProxyURL string `json:"proxyUrl,omitempty"`
+	// ActivePrompt 国际版活跃会话的用户消息内容；为空使用默认 "hi"。
+	// 太短的问候可能被服务端判定为非有效会话，可自定义更自然的多句提问。
+	ActivePrompt string `json:"activePrompt,omitempty"`
 }
 
 // ValidProxyScheme 代理协议白名单

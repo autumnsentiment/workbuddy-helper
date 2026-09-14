@@ -490,21 +490,35 @@ func (c *Client) DailyCheckin(a *model.Account) error {
 	return err
 }
 
+// DefaultActivePrompt 活跃会话默认消息（用户自定义留空时的兜底）
+const DefaultActivePrompt = "你是谁，谁开发你的，现在是什么时间，什么天气"
+
 // ActiveChat 以客户端特征发送一次对话会话。
 // 国际版（workbuddy.ai）的每日积分按“活跃账号”发放：每天至少发起一次对话；
 // 请求完全对齐国际版客户端（CLI User-Agent、X-Product: SaaS、stream、system 消息在前），
 // 逆向实测：第一条消息必须是 system，否则返回 400 code=11128。
-func (c *Client) ActiveChat(a *model.Account, modelName string) error {
+// prompt 为用户消息内容：过短问候（如 "hi"）可能被服务端判定为非有效会话，
+// 自定义更自然的多句提问可提高会话有效性；prompt 留空使用 DefaultActivePrompt。
+func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 	if strings.TrimSpace(modelName) == "" {
 		modelName = "hy3"
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		prompt = DefaultActivePrompt
+	}
+	// max_tokens 按提示词长度放宽：保证模型能完整作答，会话被判有效
+	maxTokens := 64
+	if r := []rune(prompt); len(r) > 40 {
+		maxTokens = 160
 	}
 	body, _ := json.Marshal(map[string]any{
 		"model":      modelName,
 		"stream":     true,
-		"max_tokens": 16,
+		"max_tokens": maxTokens,
 		"messages": []map[string]string{
 			{"role": "system", "content": "You are a helpful assistant."},
-			{"role": "user", "content": "Hi"},
+			{"role": "user", "content": prompt},
 		},
 	})
 	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/v2/chat/completions", bytes.NewReader(body))
