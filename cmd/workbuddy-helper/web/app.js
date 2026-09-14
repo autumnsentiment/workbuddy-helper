@@ -606,10 +606,10 @@
     elements.proxyHost.placeholder = proxy.scheme
       ? "host:port（支持认证 user:pass@host:port）"
       : "选择协议后填写网关地址:端口（如 192.168.5.1:1070）";
-    elements.activeModelRow.hidden = !intl;
-    elements.activePromptRow.hidden = !intl;
-    elements.recheckDelayRow.hidden = !intl;
-    if (!intl) elements.activePrompt.value = app.settings.activePrompt || "";
+    // 活跃模型/提示词/复核延迟跟随当前查看的版本列表显示（切到国际版即可见、可改）
+    elements.activeModelRow.hidden = !viewIntl;
+    elements.activePromptRow.hidden = !viewIntl;
+    elements.recheckDelayRow.hidden = !viewIntl;
     // 按钮文案跟随当前查看的版本列表（签到=国内列表 / 活跃=国际列表）
     elements.runAllLabel.textContent = viewIntl ? "全部活跃" : "全部签到";
     if (elements.colDaily) elements.colDaily.textContent = intl ? "今日活跃" : "今日签到";
