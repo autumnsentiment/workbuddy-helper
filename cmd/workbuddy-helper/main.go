@@ -29,10 +29,13 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
+// appVersion 由构建脚本通过 -ldflags 注入（如 1.0.2）
+var appVersion = "dev"
+
 func main() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		fmt.Fprintf(out, "WorkBuddy Helper — 腾讯 WorkBuddy/CodeBuddy 多账户签到与积分看板\n\n")
+		fmt.Fprintf(out, "WorkBuddy Helper v%s — 腾讯 WorkBuddy/CodeBuddy 多账户签到与积分看板\n\n", appVersion)
 		fmt.Fprintf(out, "用法:\n")
 		fmt.Fprintf(out, "  workbuddy-helper [选项]                    # 启动本地服务\n")
 		fmt.Fprintf(out, "  workbuddy-helper --export-portable DIR    # 导出当前数据为可移植副本(供 Docker 使用)\n")
@@ -52,6 +55,7 @@ func main() {
 	flag.Parse()
 
 	log.SetFlags(log.Ldate | log.Ltime | log.LUTC)
+	server.SetVersion(appVersion)
 
 	if *exportPortable != "" {
 		runExport(defaultExportSource(*dataDir), *exportPortable)
@@ -118,7 +122,7 @@ func main() {
 		}
 	}()
 
-	fmt.Printf("WorkBuddy Helper 已启动: %s\n", serverAddr)
+	fmt.Printf("WorkBuddy Helper v%s 已启动: %s\n", appVersion, serverAddr)
 	fmt.Printf("凭据加密存放于: %s\n", *dataDir)
 	if !*noOpen {
 		if err := openBrowser(serverAddr); err != nil {

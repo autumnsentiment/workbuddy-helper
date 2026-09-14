@@ -22,11 +22,22 @@ type Server struct {
 	service  *service.Service
 	web      fs.FS
 	host     string
+	version  string
 	shutdown func()
 }
 
 func New(svc *service.Service, web fs.FS, host string, shutdown func()) *Server {
-	return &Server{service: svc, web: web, host: host, shutdown: shutdown}
+	return &Server{service: svc, web: web, host: host, version: buildVersion, shutdown: shutdown}
+}
+
+// buildVersion 由 main 通过 SetVersion 注入（ldflags 构建注入）
+var buildVersion = "dev"
+
+// SetVersion 注入构建版本号（main 在启动时调用）
+func SetVersion(v string) {
+	if v != "" {
+		buildVersion = v
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -34,13 +45,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok")
+		_, _ = io.WriteString(w, "ok "+buildVersion)
 	})
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("GET /api/logs", s.handleLogs)
 	mux.HandleFunc("POST /api/login/start", s.handleLoginStart)
 	mux.HandleFunc("POST /api/login/poll", s.handleLoginPoll)
 	mux.HandleFunc("POST /api/run-all", s.handleRunAll)
+	mux.HandleFunc("POST /api/refresh-points", s.handleRefreshPoints)
 	mux.HandleFunc("PUT /api/settings", s.handleSettings)
 	mux.HandleFunc("POST /api/shutdown", s.handleShutdown)
 	mux.HandleFunc("/api/accounts/", s.handleAccount)
@@ -118,9 +130,20 @@ func (s *Server) handleState(w http.ResponseWriter, _ *http.Request) {
 			enabled++
 		}
 	}
+	cnAccounts := make([]model.PublicAccount, 0, len(accounts))
+	intlAccounts := make([]model.PublicAccount, 0, len(accounts))
+	for _, a := range accounts {
+		if a.Version == model.ModeIntl {
+			intlAccounts = append(intlAccounts, a)
+		} else {
+			cnAccounts = append(cnAccounts, a)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts": accounts,
-		"settings": state.Settings,
+		"accounts":     accounts,
+		"cnAccounts":   cnAccounts,
+		"intlAccounts": intlAccounts,
+		"settings":     state.Settings,
 		"summary": map[string]any{
 			"accounts": len(accounts), "enabled": enabled, "balance": balance, "used": used, "total": total,
 		},
@@ -136,8 +159,12 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"logs": s.service.Logs(limit)})
 }
 
-func (s *Server) handleLoginStart(w http.ResponseWriter, _ *http.Request) {
-	id, authURL, err := s.service.StartLogin()
+func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Version string `json:"version"`
+	}
+	_ = decodeJSON(r, &body)
+	id, authURL, err := s.service.StartLogin(strings.TrimSpace(body.Version))
 	if err != nil {
 		writeError(w, http.StatusBadGateway, friendlyError(err))
 		return
@@ -180,6 +207,14 @@ func errorsAs(err error, target any) bool {
 
 func (s *Server) handleRunAll(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": s.service.RunAll()})
+}
+
+func (s *Server) handleRefreshPoints(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Version string `json:"version"`
+	}
+	_ = decodeJSON(r, &body)
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": s.service.RefreshAllPoints(strings.TrimSpace(body.Version))})
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -254,6 +289,8 @@ func (s *Server) handleAccount(w http.ResponseWriter, r *http.Request) {
 	switch parts[1] {
 	case "checkin":
 		account, err = s.service.Checkin(id)
+	case "active":
+		account, err = s.service.ActiveChat(id)
 	case "points":
 		account, err = s.service.Points(id)
 	default:

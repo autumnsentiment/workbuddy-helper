@@ -1,4 +1,3 @@
-
 package service
 
 import (
@@ -20,6 +19,7 @@ func newAccountService(t *testing.T, handler http.HandlerFunc) (*Service, func()
 	state.Accounts = []model.Account{{
 		ID:           "a1",
 		UID:          "u1",
+		Version:      model.ModeCN,
 		Nickname:     "测试账户",
 		AccessToken:  "old-access",
 		RefreshToken: "old-refresh",
@@ -56,7 +56,7 @@ func writeEnvelope(w http.ResponseWriter, status, code int, msg, data string) {
 	_, _ = fmt.Fprintf(w, `{"code":%d,"msg":%q,"data":%s}`, code, msg, data)
 }
 
-const pointsData = `{"Response":{"Data":{"Accounts":[{"PackageName":"体验包","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}]}}}`
+var pointsData = `{"Response":{"Data":{"Accounts":[{"PackageName":"体验包","CycleCapacitySize":100,"CycleCapacityRemain":80,"CycleCapacityUsed":20}]}}}`
 
 func TestCheckinIsIdempotentForBeijingDay(t *testing.T) {
 	checkins, pointQueries := 0, 0
@@ -146,5 +146,120 @@ func TestCheckinRefreshesOnceAfterUnauthorized(t *testing.T) {
 	}
 	if checkins != 2 || refreshes != 1 || account.LastCheckin != "confirmed" {
 		t.Fatalf("checkins=%d refreshes=%d account=%+v", checkins, refreshes, account)
+	}
+}
+
+const chatOK = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+
+func TestActiveChatSchedulesPointsRecheck(t *testing.T) {
+	chats, pointQueries := 0, 0
+	svc, closeUpstream := newAccountService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/chat/completions":
+			chats++
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(chatOK))
+		case "/v2/billing/meter/get-user-resource":
+			pointQueries++
+			writeEnvelope(w, http.StatusOK, 0, "ok", pointsData)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer closeUpstream()
+
+	account, err := svc.ActiveChat("a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chats != 1 || pointQueries != 1 {
+		t.Fatalf("chats=%d pointQueries=%d", chats, pointQueries)
+	}
+	if account.LastActive != "confirmed" || account.LastActiveDate != today() || account.PendingRecheckAt.IsZero() {
+		t.Fatalf("unexpected account: %+v", account)
+	}
+	if account.Balance != 80 {
+		t.Fatalf("baseline balance=%d", account.Balance)
+	}
+	if internal, _ := svc.getAccount("a1"); internal.BalanceBeforeActive != 80 {
+		t.Fatalf("balanceBeforeActive=%d", internal.BalanceBeforeActive)
+	}
+
+	// 复核到期但积分无变化 → 重试一次排期
+	if err := svc.updateAccount("a1", func(a *model.Account) { a.PendingRecheckAt = time.Now().Add(-time.Minute) }); err != nil {
+		t.Fatal(err)
+	}
+	svc.runPendingRechecks()
+	updated, _ := svc.getAccount("a1")
+	if updated.RecheckAttempts != 1 || updated.PendingRecheckAt.IsZero() {
+		t.Fatalf("attempts=%d pending=%v", updated.RecheckAttempts, updated.PendingRecheckAt)
+	}
+
+	// 积分到账（+30）→ 复核完成并清空排期
+	pointsData = `{"Response":{"Data":{"Accounts":[{"PackageName":"体验包","CycleCapacitySize":130,"CycleCapacityRemain":110,"CycleCapacityUsed":20}]}}}`
+	if err := svc.updateAccount("a1", func(a *model.Account) { a.PendingRecheckAt = time.Now().Add(-time.Minute) }); err != nil {
+		t.Fatal(err)
+	}
+	svc.runPendingRechecks()
+	updated, _ = svc.getAccount("a1")
+	if !updated.PendingRecheckAt.IsZero() || updated.Balance != 110 {
+		t.Fatalf("pending=%v balance=%d", updated.PendingRecheckAt, updated.Balance)
+	}
+}
+
+func TestRunAllUsesActiveChatInIntlMode(t *testing.T) {
+	chats, checkins := 0, 0
+	svc, closeUpstream := newAccountService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/chat/completions":
+			chats++
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(chatOK))
+		case "/v2/billing/meter/daily-checkin":
+			checkins++
+			writeEnvelope(w, http.StatusOK, 0, "ok", `{}`)
+		case "/v2/billing/meter/get-user-resource":
+			writeEnvelope(w, http.StatusOK, 0, "ok", pointsData)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer closeUpstream()
+
+	if err := svc.UpdateSettings(model.Settings{ScheduleEnabled: false, ScheduleTime: "09:15", Mode: model.ModeIntl, ActiveModel: "hy3", RecheckDelayMinutes: 60}); err != nil {
+		t.Fatal(err)
+	}
+	// RunAll 只对当前版本（intl）列表执行；a1 是 CN 账号，先将其并入 intl 列表
+	if err := svc.updateAccount("a1", func(a *model.Account) { a.Version = model.ModeIntl }); err != nil {
+		t.Fatal(err)
+	}
+	results := svc.RunAll()
+	if len(results) != 1 || chats != 1 || checkins != 0 {
+		t.Fatalf("results=%d chats=%d checkins=%d", len(results), chats, checkins)
+	}
+	if results[0].LastActive != "confirmed" {
+		t.Fatalf("unexpected result: %+v", results[0])
+	}
+}
+
+func TestUpdateSettingsValidatesModeAndModel(t *testing.T) {
+	svc, closeUpstream := newAccountService(t, func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	})
+	defer closeUpstream()
+
+	if err := svc.UpdateSettings(model.Settings{ScheduleEnabled: false, ScheduleTime: "09:15", Mode: "jp"}); err == nil {
+		t.Fatal("invalid mode should be rejected")
+	}
+	if err := svc.UpdateSettings(model.Settings{ScheduleEnabled: false, ScheduleTime: "09:15", Mode: model.ModeIntl, ActiveModel: "gpt-4"}); err == nil {
+		t.Fatal("invalid model should be rejected")
+	}
+	if err := svc.UpdateSettings(model.Settings{ScheduleEnabled: false, ScheduleTime: "09:15", Mode: model.ModeIntl, ActiveModel: "hy4-preview", RecheckDelayMinutes: 90}); err != nil {
+		t.Fatal(err)
+	}
+	state, _ := svc.Snapshot()
+	settings := state.Settings
+	if settings.Mode != model.ModeIntl || settings.ActiveModel != "hy4-preview" || settings.RecheckDelayMinutes != 90 {
+		t.Fatalf("unexpected settings: %+v", settings)
 	}
 }

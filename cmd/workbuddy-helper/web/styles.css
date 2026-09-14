@@ -1724,3 +1724,27 @@ select:disabled {
     animation-iteration-count: 1 !important;
   }
 }
+
+.field-hint {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.form-row .select-field select {
+  width: 100%;
+}
+
+.heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.version-switch select {
+  min-width: 96px;
+  padding: 7px 30px 7px 11px;
+  font-weight: 650;
+}

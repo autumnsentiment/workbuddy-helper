@@ -41,6 +41,16 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 	if state.Version == 0 {
 		state.Version = model.StateVersion
 	}
+	// 兼容旧状态文件：补齐版本模式相关默认值
+	if state.Settings.Mode == "" {
+		state.Settings.Mode = model.ModeCN
+	}
+	if state.Settings.ActiveModel == "" {
+		state.Settings.ActiveModel = "hy3"
+	}
+	if state.Settings.RecheckDelayMinutes == 0 {
+		state.Settings.RecheckDelayMinutes = 60
+	}
 	if state.Accounts == nil {
 		state.Accounts = []model.Account{}
 	}
@@ -169,8 +179,13 @@ func (s *Service) updateAccount(id string, fn func(*model.Account)) error {
 	return fmt.Errorf("account not found")
 }
 
-func (s *Service) StartLogin() (id, authURL string, err error) {
-	session := client.NewLoginSession()
+// StartLogin 发起登录授权；version 为空按每日任务版本，cn=国内 CLI 授权，
+// intl=国际版授权（authUrl 为 workbuddy.ai/login?platform=workbuddy-ai&state=...）
+func (s *Service) StartLogin(version string) (id, authURL string, err error) {
+	if version != model.ModeCN && version != model.ModeIntl {
+		version = s.mode()
+	}
+	session := client.NewLoginSession(version)
 	if err := session.Start(); err != nil {
 		return "", "", err
 	}
@@ -218,6 +233,7 @@ func (s *Service) PollLogin(id string) (model.PublicAccount, error) {
 			a.Nickname = result.Nickname
 		}
 		a.Domain = result.Domain
+		a.Version = versionForDomain(result.Domain)
 		a.AccessToken = result.AccessToken
 		a.RefreshToken = result.RefreshToken
 		a.ExpiresAt = now.Add(time.Duration(result.ExpiresIn) * time.Second).Unix()
@@ -247,6 +263,7 @@ func (s *Service) PollLogin(id string) (model.PublicAccount, error) {
 		EnterpriseID: result.EnterpriseID,
 		Nickname:     result.Nickname,
 		Domain:       result.Domain,
+		Version:      versionForDomain(result.Domain),
 		AccessToken:  result.AccessToken,
 		RefreshToken: result.RefreshToken,
 		ExpiresAt:    now.Add(time.Duration(result.ExpiresIn) * time.Second).Unix(),
@@ -307,11 +324,85 @@ func (s *Service) UpdateSettings(settings model.Settings) error {
 		return fmt.Errorf("scheduleTime 必须是 HH:MM")
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 空值表示保留当前设置（兼容旧前端只提交签到调度字段的场景）
+	mode := settings.Mode
+	if mode == "" {
+		mode = s.state.Settings.Mode
+	}
+	if mode != model.ModeCN && mode != model.ModeIntl {
+		return fmt.Errorf("mode 必须是 cn（国内版）或 intl（国际版）")
+	}
+	activeModel := strings.TrimSpace(settings.ActiveModel)
+	if activeModel == "" {
+		activeModel = s.state.Settings.ActiveModel
+	}
+	if !validActiveModel(activeModel) {
+		return fmt.Errorf("activeModel 仅支持 hy3 / hy4-preview")
+	}
+	delay := settings.RecheckDelayMinutes
+	if delay == 0 {
+		delay = s.state.Settings.RecheckDelayMinutes
+	}
+	if delay < 5 || delay > 720 {
+		return fmt.Errorf("recheckDelayMinutes 需在 5-720 之间")
+	}
 	s.state.Settings.ScheduleEnabled = settings.ScheduleEnabled
 	s.state.Settings.ScheduleTime = settings.ScheduleTime
-	err := s.saveLocked()
-	s.mu.Unlock()
-	return err
+	s.state.Settings.Mode = mode
+	s.state.Settings.ActiveModel = activeModel
+	s.state.Settings.RecheckDelayMinutes = delay
+	return s.saveLocked()
+}
+
+// activeModels 活跃对话可选模型（与前端下拉一致）
+var activeModels = map[string]bool{
+	"hy3":         true,
+	"hy4-preview": true,
+}
+
+func validActiveModel(name string) bool {
+	return activeModels[name]
+}
+
+// mode 返回当前版本模式：cn（每日签到）或 intl（活跃对话获取积分）
+func (s *Service) mode() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.state.Settings.Mode == model.ModeIntl {
+		return model.ModeIntl
+	}
+	return model.ModeCN
+}
+
+func (s *Service) activeModel() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if m := strings.TrimSpace(s.state.Settings.ActiveModel); m != "" {
+		return m
+	}
+	return "hy3"
+}
+
+// accountVersion 返回账号归属版本：优先 Version 字段，缺省按 domain 推断（兼容旧数据）
+func (s *Service) accountVersion(a model.Account) string {
+	if a.Version == model.ModeCN || a.Version == model.ModeIntl {
+		return a.Version
+	}
+	if model.IsGlobalDomain(a.Domain) {
+		return model.ModeIntl
+	}
+	return model.ModeCN
+}
+
+func (s *Service) recheckDelay() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	minutes := s.state.Settings.RecheckDelayMinutes
+	if minutes < 5 || minutes > 720 {
+		minutes = 60
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 func (s *Service) shouldRefresh(a model.Account) bool {
@@ -461,6 +552,65 @@ func (s *Service) Checkin(id string) (model.PublicAccount, error) {
 	return updated.Public(), nil
 }
 
+// versionForDomain 按登录域判定账号归属版本列表
+func versionForDomain(domain string) string {
+	if model.IsGlobalDomain(domain) {
+		return model.ModeIntl
+	}
+	return model.ModeCN
+}
+
+// ActiveChat 国际版活跃流程：以客户端特征发送一次对话（hy3/hy4-preview），
+// 使账号被认定为当日活跃；积分非即时到账，按设置延迟排期复核并记录到账变化。
+func (s *Service) ActiveChat(id string) (model.PublicAccount, error) {
+	lock := s.accountLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	a, err := s.prepareAccount(id)
+	if err != nil {
+		return a.Public(), err
+	}
+	if a.LastActiveDate == today() && a.LastActive == "confirmed" {
+		s.markStatus(id, a.LastActive, "今日已活跃，跳过重复对话")
+		_ = s.refreshPoints(id, a)
+		updated, _ := s.getAccount(id)
+		return updated.Public(), nil
+	}
+	s.markStatus(id, "running", "正在发送活跃会话")
+	// 先刷新一次积分作为基线，供延迟复核对比到账变化
+	_ = s.refreshPoints(id, a)
+	err = s.client.ActiveChat(&a, s.activeModel())
+	if client.IsKind(err, client.KindAuthDead) {
+		if refreshErr := s.refreshAccount(id, &a); refreshErr == nil {
+			err = s.client.ActiveChat(&a, s.activeModel())
+		} else {
+			return a.Public(), refreshErr
+		}
+	}
+	if err != nil {
+		s.markError(id, err)
+		return a.Public(), err
+	}
+	now := time.Now()
+	delay := s.recheckDelay()
+	if err := s.updateAccount(id, func(dst *model.Account) {
+		dst.LastActiveAt = now
+		dst.LastActiveDate = today()
+		dst.LastActive = "confirmed"
+		dst.LastActiveMsg = "活跃会话已发送"
+		dst.Status = "confirmed"
+		dst.LastError = ""
+		dst.BalanceBeforeActive = dst.Balance
+		dst.PendingRecheckAt = now.Add(delay)
+		dst.RecheckAttempts = 0
+	}); err != nil {
+		return a.Public(), err
+	}
+	s.appendLog("info", id, fmt.Sprintf("活跃会话已发送（模型 %s），%d 分钟后自动复核积分到账", s.activeModel(), int(delay.Minutes())))
+	updated, _ := s.getAccount(id)
+	return updated.Public(), nil
+}
+
 func (s *Service) refreshPoints(id string, a model.Account) error {
 	result, err := s.client.Points(&a)
 	if err != nil {
@@ -506,10 +656,12 @@ func (s *Service) Points(id string) (model.PublicAccount, error) {
 }
 
 func (s *Service) RunAll() []model.PublicAccount {
+	mode := s.mode()
 	s.mu.RLock()
 	ids := make([]string, 0, len(s.state.Accounts))
 	for _, a := range s.state.Accounts {
-		if a.Enabled {
+		// 版本切换 = 切换账号列表：只对当前版本列表执行
+		if a.Enabled && s.accountVersion(a) == mode {
 			ids = append(ids, a.ID)
 		}
 	}
@@ -519,7 +671,51 @@ func (s *Service) RunAll() []model.PublicAccount {
 		if i > 0 {
 			time.Sleep(1200 * time.Millisecond)
 		}
-		account, err := s.Checkin(id)
+		var account model.PublicAccount
+		var err error
+		if mode == model.ModeIntl {
+			account, err = s.ActiveChat(id)
+		} else {
+			account, err = s.Checkin(id)
+		}
+		if err != nil {
+			if latest, getErr := s.getAccount(id); getErr == nil {
+				account = latest.Public()
+			}
+		}
+		results = append(results, account)
+	}
+	return results
+}
+
+// RefreshAllPoints 一键刷新已启用账户的积分（不执行签到/活跃）。
+// version 为空刷新全部；为 cn/intl 时只刷新对应版本账号列表（与前端当前查看版本一致）。
+func (s *Service) RefreshAllPoints(version string) []model.PublicAccount {
+	s.mu.RLock()
+	ids := make([]string, 0, len(s.state.Accounts))
+	for _, a := range s.state.Accounts {
+		if !a.Enabled {
+			continue
+		}
+		if version == model.ModeCN || version == model.ModeIntl {
+			// 指定版本：只刷新该版本列表
+			if s.accountVersion(a) == version {
+				ids = append(ids, a.ID)
+			}
+		} else {
+			// 未指定：刷新当前任务版本列表
+			if s.accountVersion(a) == s.mode() {
+				ids = append(ids, a.ID)
+			}
+		}
+	}
+	s.mu.RUnlock()
+	results := make([]model.PublicAccount, 0, len(ids))
+	for i, id := range ids {
+		if i > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+		account, err := s.Points(id)
 		if err != nil {
 			if latest, getErr := s.getAccount(id); getErr == nil {
 				account = latest.Public()
@@ -538,6 +734,7 @@ func (s *Service) StartScheduler() {
 			select {
 			case <-ticker.C:
 				s.runScheduledIfDue()
+				s.runPendingRechecks()
 			case <-s.stop:
 				return
 			}
@@ -571,12 +768,80 @@ func (s *Service) runScheduledIfDue() {
 	if settings.LastScheduledDay == day {
 		return
 	}
-	s.appendLog("info", "", "开始执行每日批量签到和积分刷新")
+	if s.mode() == model.ModeIntl {
+		s.appendLog("info", "", "开始执行每日批量活跃任务")
+	} else {
+		s.appendLog("info", "", "开始执行每日批量签到和积分刷新")
+	}
 	s.RunAll()
 	s.mu.Lock()
 	s.state.Settings.LastScheduledDay = day
 	_ = s.saveLocked()
 	s.mu.Unlock()
+}
+
+// runPendingRechecks 执行到期的积分到账复核：积分非即时到账，
+// 活跃后按延迟复查；无变化时最多重试 3 次，避免无限轮询。
+func (s *Service) runPendingRechecks() {
+	now := time.Now()
+	var dueIDs []string
+	s.mu.RLock()
+	for _, a := range s.state.Accounts {
+		if a.Enabled && !a.PendingRecheckAt.IsZero() && !a.PendingRecheckAt.After(now) {
+			dueIDs = append(dueIDs, a.ID)
+		}
+	}
+	s.mu.RUnlock()
+	for _, id := range dueIDs {
+		lock := s.accountLock(id)
+		if !lock.TryLock() {
+			continue
+		}
+		s.recheckAccount(id)
+		lock.Unlock()
+	}
+}
+
+func (s *Service) recheckAccount(id string) {
+	a, err := s.getAccount(id)
+	if err != nil || a.PendingRecheckAt.IsZero() || a.PendingRecheckAt.After(time.Now()) {
+		return
+	}
+	// delay 须在 updateAccount（持有写锁）之外取好，回调内不能再调 s.recheckDelay()
+	delay := s.recheckDelay()
+	before := a.BalanceBeforeActive
+	if err := s.refreshPoints(id, a); err != nil {
+		// 查询失败顺延到下一个周期再试
+		s.updateAccount(id, func(dst *model.Account) {
+			dst.PendingRecheckAt = time.Now().Add(delay)
+		})
+		return
+	}
+	latest, _ := s.getAccount(id)
+	delta := latest.Balance - before
+	attempts := latest.RecheckAttempts + 1
+	switch {
+	case delta > 0:
+		s.updateAccount(id, func(dst *model.Account) {
+			dst.PendingRecheckAt = time.Time{}
+			dst.RecheckAttempts = 0
+			dst.BalanceBeforeActive = 0
+		})
+		s.appendLog("info", id, fmt.Sprintf("积分已到账：%d → %d（+%d）", before, latest.Balance, delta))
+	case attempts >= 3:
+		s.updateAccount(id, func(dst *model.Account) {
+			dst.PendingRecheckAt = time.Time{}
+			dst.RecheckAttempts = attempts
+			dst.BalanceBeforeActive = 0
+		})
+		s.appendLog("info", id, fmt.Sprintf("积分复核 %d 次暂无变化（余额 %d），停止自动复核，可稍后手动刷新", attempts, latest.Balance))
+	default:
+		s.updateAccount(id, func(dst *model.Account) {
+			dst.RecheckAttempts = attempts
+			dst.PendingRecheckAt = time.Now().Add(delay)
+		})
+		s.appendLog("info", id, fmt.Sprintf("积分暂未到账（余额 %d），已排期第 %d 次复核", latest.Balance, attempts+1))
+	}
 }
 
 func (s *Service) appendLog(level, accountID, message string) {

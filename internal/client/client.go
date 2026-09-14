@@ -19,7 +19,15 @@ const (
 	CNChatBase    = "https://copilot.tencent.com"
 	CNBillingBase = "https://www.codebuddy.cn"
 	GlobalBase    = "https://www.workbuddy.ai"
-	ClientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
+	// 国际版 billing 与国内版一样挂在 codebuddy 域（逆向自国际版客户端，实测确认）
+	GlobalBillingBase = "https://www.codebuddy.ai"
+	ClientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
+
+	// 国际版桌面客户端特征（逆向自 WorkBuddy AI 5.5.2 主进程 CLIENT_INFO_* 注入与
+	// CLI UserAgentHttpInterceptor 拼装算法，实测 plans-usage 按此识别客户端）
+	IntlClientUA   = "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1"
+	IntlClientName = "WorkBuddy"
+	IntlClientVer  = "5.5.2"
 )
 
 type Kind string
@@ -58,6 +66,7 @@ type Client struct {
 	ChatBaseCN    string
 	BillingBaseCN string
 	GlobalBase    string
+	GlobalBilling string
 }
 
 func New() *Client {
@@ -77,11 +86,15 @@ func New() *Client {
 		ChatBaseCN:    CNChatBase,
 		BillingBaseCN: CNBillingBase,
 		GlobalBase:    GlobalBase,
+		GlobalBilling: GlobalBillingBase,
 	}
 }
 
 func (c *Client) base(a *model.Account, billing bool) string {
 	if a != nil && isGlobal(a.Domain) {
+		if billing {
+			return c.GlobalBilling
+		}
 		return c.GlobalBase
 	}
 	if billing {
@@ -91,8 +104,7 @@ func (c *Client) base(a *model.Account, billing bool) string {
 }
 
 func isGlobal(domain string) bool {
-	domain = strings.ToLower(strings.TrimSpace(domain))
-	return domain == "workbuddy.ai" || strings.HasSuffix(domain, ".workbuddy.ai")
+	return model.IsGlobalDomain(domain)
 }
 
 func commonHeaders(req *http.Request, origin string) {
@@ -203,25 +215,55 @@ type LoginSession struct {
 	State   string
 	AuthURL string
 	Client  *http.Client
+	// intl=true 时走国际版授权（workbuddy.ai，platform=workbuddy-ai）
+	intl bool
 }
 
-func NewLoginSession() *LoginSession {
+// NewLoginSession version: ModeCN（国内版 CLI 授权）/ ModeIntl（国际版授权）
+func NewLoginSession(version string) *LoginSession {
 	jar, _ := cookiejar.New(nil)
-	return &LoginSession{Client: &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     jar,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
+	return &LoginSession{
+		Client: &http.Client{
+			Timeout: 30 * time.Second,
+			Jar:     jar,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
-	}}
+		intl: version == model.ModeIntl,
+	}
+}
+
+func (s *LoginSession) chatBase() string {
+	if s.intl {
+		return GlobalBase
+	}
+	return CNChatBase
+}
+
+// origin 登录接口的 Origin/Referer（对齐各版本客户端）
+func (s *LoginSession) origin() string {
+	if s.intl {
+		return "https://www.workbuddy.ai"
+	}
+	return "https://www.codebuddy.cn"
+}
+
+// platform 授权页 platform 参数：国内 CLI / 国际 workbuddy-ai（逆向实测确认）
+func (s *LoginSession) platform() string {
+	if s.intl {
+		return "workbuddy-ai"
+	}
+	return "CLI"
 }
 
 func (s *LoginSession) Start() error {
-	req, err := http.NewRequest(http.MethodPost, CNChatBase+"/v2/plugin/auth/state?platform=CLI", bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequest(http.MethodPost, s.chatBase()+"/v2/plugin/auth/state?platform="+url.QueryEscape(s.platform()), bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return err
 	}
-	commonHeaders(req, "https://www.codebuddy.cn")
+	commonHeaders(req, s.origin())
+	req.Header.Set("X-Domain", strings.TrimPrefix(strings.TrimPrefix(s.chatBase(), "https://"), "http://"))
 	data, _, err := (&Client{HTTP: s.Client}).doEnvelope(req)
 	if err != nil {
 		return err
@@ -252,12 +294,12 @@ func (s *LoginSession) Poll() (LoginResult, error) {
 		return LoginResult{}, fmt.Errorf("登录会话不存在")
 	}
 	base := &Client{HTTP: s.Client}
-	tokenURL := CNChatBase + "/v2/plugin/auth/token?state=" + url.QueryEscape(s.State)
+	tokenURL := s.chatBase() + "/v2/plugin/auth/token?state=" + url.QueryEscape(s.State)
 	req, err := http.NewRequest(http.MethodGet, tokenURL, nil)
 	if err != nil {
 		return LoginResult{}, err
 	}
-	commonHeaders(req, "https://www.codebuddy.cn")
+	commonHeaders(req, s.origin())
 	data, status, err := base.doEnvelope(req)
 	if err != nil {
 		if status >= 400 && status < 500 {
@@ -275,12 +317,16 @@ func (s *LoginSession) Poll() (LoginResult, error) {
 		return LoginResult{}, &Error{Kind: KindProtocol, Msg: "登录服务未返回有效令牌"}
 	}
 	result := LoginResult{AccessToken: tok.AccessToken, RefreshToken: tok.RefreshToken, ExpiresIn: tok.ExpiresIn, Domain: tok.Domain}
-	acctURL := CNChatBase + "/v2/plugin/login/account?state=" + url.QueryEscape(s.State)
+	// 国际版 token 响应未回传 domain 时，按授权域补齐（避免误判为国内账号）
+	if result.Domain == "" && s.intl {
+		result.Domain = "www.workbuddy.ai"
+	}
+	acctURL := s.chatBase() + "/v2/plugin/login/account?state=" + url.QueryEscape(s.State)
 	acctReq, err := http.NewRequest(http.MethodGet, acctURL, nil)
 	if err != nil {
 		return result, err
 	}
-	commonHeaders(acctReq, "https://www.codebuddy.cn")
+	commonHeaders(acctReq, s.origin())
 	acctReq.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	acctData, _, acctErr := base.doEnvelope(acctReq)
 	if acctErr != nil {
@@ -309,9 +355,14 @@ func (c *Client) Refresh(a *model.Account) error {
 	if err != nil {
 		return err
 	}
+	// 国际版客户端刷新头对齐：X-Auth-Refresh-Source 为 plugin（逆向自国际版客户端 refreshSession）
+	source := "workbuddy"
+	if isGlobal(a.Domain) {
+		source = "plugin"
+	}
 	commonHeaders(req, originFor(a))
 	req.Header.Set("X-Refresh-Token", a.RefreshToken)
-	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+	req.Header.Set("X-Auth-Refresh-Source", source)
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}
@@ -358,6 +409,70 @@ func (c *Client) DailyCheckin(a *model.Account) error {
 	authHeaders(req, a, true)
 	_, _, err = c.doEnvelope(req)
 	return err
+}
+
+// ActiveChat 以客户端特征发送一次对话会话。
+// 国际版（workbuddy.ai）的每日积分按“活跃账号”发放：每天至少发起一次对话；
+// 请求完全对齐国际版客户端（CLI User-Agent、X-Product: SaaS、stream、system 消息在前），
+// 逆向实测：第一条消息必须是 system，否则返回 400 code=11128。
+func (c *Client) ActiveChat(a *model.Account, modelName string) error {
+	if strings.TrimSpace(modelName) == "" {
+		modelName = "hy3"
+	}
+	body, _ := json.Marshal(map[string]any{
+		"model":      modelName,
+		"stream":     true,
+		"max_tokens": 16,
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a helpful assistant."},
+			{"role": "user", "content": "Hi"},
+		},
+	})
+	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/v2/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	chatHeaders(req, a)
+	req.Header.Set("Accept", "text/event-stream")
+	if isGlobal(a.Domain) {
+		// 活跃记录按客户端识别：必须带 WorkBuddy 桌面端特征（X-IDE-* + 客户端 UA），
+		// 缺失会在 plans-usage 里显示为未知客户端
+		req.Header.Set("User-Agent", IntlClientUA)
+		req.Header.Set("X-IDE-Type", IntlClientName)
+		req.Header.Set("X-IDE-Name", IntlClientName)
+		req.Header.Set("X-IDE-Version", IntlClientVer)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return &Error{Kind: KindTransport, Msg: err.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		return classifyHTTP(resp.StatusCode, string(raw))
+	}
+	// 2xx：读完整个 SSE 流（max_tokens 很小，秒级结束），确保服务端完整受理本次会话
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// chatHeaders 模拟桌面客户端对话请求头：活跃判定只认客户端请求，网页端请求无效。
+// 头集合与实测请求一致：Authorization / X-User-Id / X-Domain / X-Product。
+func chatHeaders(req *http.Request, a *model.Account) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", ClientUA)
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	if a.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	}
+	if a.Domain != "" {
+		req.Header.Set("X-Domain", a.Domain)
+	}
+	req.Header.Set("X-Product", "SaaS")
 }
 
 type PointResult struct {

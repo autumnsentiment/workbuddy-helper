@@ -11,6 +11,7 @@
     lastUpdated: document.querySelector("#last-updated"),
     summaryTotal: document.querySelector("#summary-total"),
     summaryChecked: document.querySelector("#summary-checked"),
+    summaryCheckedLabel: document.querySelector("#summary-checked-label"),
     summaryPoints: document.querySelector("#summary-points"),
     summaryEnabled: document.querySelector("#summary-enabled"),
     accountCount: document.querySelector("#account-count"),
@@ -20,12 +21,23 @@
     statusFilter: document.querySelector("#status-filter"),
     refreshState: document.querySelector("#refresh-state"),
     runAll: document.querySelector("#run-all"),
+    runAllLabel: document.querySelector("#run-all-label"),
+    refreshPointsAll: document.querySelector("#refresh-points-all"),
     addAccount: document.querySelector("#add-account"),
     scheduleForm: document.querySelector("#schedule-form"),
     scheduleEnabled: document.querySelector("#schedule-enabled"),
     scheduleTime: document.querySelector("#schedule-time"),
     scheduleSummary: document.querySelector("#schedule-summary"),
     saveSchedule: document.querySelector("#save-schedule"),
+    versionMode: document.querySelector("#version-mode"),
+    modeHint: document.querySelector("#mode-hint"),
+    versionSwitch: document.querySelector("#version-switch"),
+    pageTitle: document.querySelector("#page-title"),
+    activeModel: document.querySelector("#active-model"),
+    activeModelRow: document.querySelector("#active-model-row"),
+    recheckDelay: document.querySelector("#recheck-delay"),
+    recheckDelayRow: document.querySelector("#recheck-delay-row"),
+    colDaily: document.querySelector("#col-daily"),
     drawer: document.querySelector("#log-drawer"),
     drawerBackdrop: document.querySelector("#drawer-backdrop"),
     openLogs: document.querySelector("#open-logs"),
@@ -56,9 +68,14 @@
 
   const app = {
     accounts: [],
+    allAccounts: [],
+    viewVersion: "cn",
     settings: {
       scheduleEnabled: false,
       scheduleTime: "09:15",
+      mode: "cn",
+      activeModel: "hy3",
+      recheckDelayMinutes: 60,
     },
     isLoading: true,
     loadError: "",
@@ -227,6 +244,7 @@
     return {
       ...raw,
       id,
+      version: String(firstDefined(raw?.version, raw?.region === "global" ? "intl" : "cn", "cn")),
       displayName,
       nickname,
       identity,
@@ -273,16 +291,31 @@
     const rawAccounts = Array.isArray(source) ? source : source.accounts || source.items || [];
     const rawSettings = source.settings || source.schedule || payload?.settings || {};
 
+    const cnList = Array.isArray(source.cnAccounts) ? source.cnAccounts.map(normalizeAccount) : null;
+    const intlList = Array.isArray(source.intlAccounts) ? source.intlAccounts.map(normalizeAccount) : null;
+    const fallback = Array.isArray(rawAccounts) ? rawAccounts.map(normalizeAccount) : [];
     return {
-      accounts: Array.isArray(rawAccounts) ? rawAccounts.map(normalizeAccount) : [],
+      // 两套账号列表：国内版 / 国际版独立管理，按当前查看版本取对应列表
+      cnAccounts: cnList || fallback.filter((a) => (a.version || "cn") !== "intl"),
+      intlAccounts: intlList || fallback.filter((a) => a.version === "intl"),
       settings: {
         scheduleEnabled: parseBoolean(
           firstDefined(rawSettings.scheduleEnabled, rawSettings.enabled, source.scheduleEnabled),
           false,
         ),
         scheduleTime: normalizeTime(firstDefined(rawSettings.scheduleTime, rawSettings.time, source.scheduleTime, "09:15")),
+        mode: String(firstDefined(rawSettings.mode, source.mode, "cn")) === "intl" ? "intl" : "cn",
+        activeModel: ["hy3", "hy4-preview"].includes(String(rawSettings.activeModel))
+          ? String(rawSettings.activeModel)
+          : "hy3",
+        recheckDelayMinutes: clampRecheckDelay(parseNumber(rawSettings.recheckDelayMinutes) ?? 60),
       },
     };
+  }
+
+  function clampRecheckDelay(value) {
+    if (!Number.isFinite(value)) return 60;
+    return Math.min(720, Math.max(5, Math.round(value)));
   }
 
   function getCheckinState(account) {
@@ -303,6 +336,41 @@
       return { key: "pending", label: "未签到", className: "checkin-pending" };
     }
     return { key: "unknown", label: "暂无记录", className: "checkin-unknown" };
+  }
+
+  // 国际版活跃状态：LastActive confirmed 且日期为今天 → 已活跃
+  function getActiveState(account) {
+    const state = String(account.lastActive ?? "").toLowerCase();
+    const isToday = account.lastActiveDate === localDateKey();
+    if (isToday && state === "confirmed") {
+      return { key: "done", label: "已活跃", className: "checkin-done" };
+    }
+    if (state === "confirmed" && !isToday) {
+      return { key: "pending", label: "未活跃", className: "checkin-pending" };
+    }
+    if (["failed", "error"].includes(state)) {
+      return { key: "error", label: "活跃失败", className: "checkin-error" };
+    }
+    return { key: "pending", label: "未活跃", className: "checkin-pending" };
+  }
+
+  function currentMode() {
+    return app.settings.mode === "intl" ? "intl" : "cn";
+  }
+
+  // 今日任务状态：国内版列表取签到，国际版列表取活跃（跟随当前查看的版本）
+  function getDailyState(account) {
+    return app.viewVersion === "intl" ? getActiveState(account) : getCheckinState(account);
+  }
+
+  // 积分复核倒计时提示（国际版活跃后积分延迟到账）
+  function formatRecheckMeta(account) {
+    if (!account.pendingRecheckAt) return "";
+    const due = new Date(account.pendingRecheckAt);
+    if (Number.isNaN(due.getTime())) return "";
+    const attempts = Number(account.recheckAttempts) || 0;
+    const suffix = attempts > 0 ? ` · 第 ${attempts + 1} 次复核` : "";
+    return `等待积分到账 ${timeFormatter.format(due)}${suffix}`;
   }
 
   function getHealthState(account) {
@@ -351,13 +419,15 @@
   }
 
   function renderSummary() {
+    const intl = app.viewVersion === "intl";
     const enabled = app.accounts.filter((account) => account.enabled).length;
-    const checked = app.accounts.filter((account) => getCheckinState(account).key === "done").length;
+    const checked = app.accounts.filter((account) => getDailyState(account).key === "done").length;
     const pointsValues = app.accounts.map((account) => account.points).filter((value) => value !== null);
     const pointsTotal = pointsValues.reduce((sum, value) => sum + value, 0);
 
     elements.summaryTotal.textContent = integerFormatter.format(app.accounts.length);
     elements.summaryChecked.textContent = integerFormatter.format(checked);
+    elements.summaryCheckedLabel.textContent = intl ? "今日已活跃" : "今日已签到";
     elements.summaryEnabled.textContent = integerFormatter.format(enabled);
     elements.summaryPoints.textContent = pointsValues.length ? numberFormatter.format(pointsTotal) : "--";
   }
@@ -427,14 +497,19 @@
     }
 
     elements.tableState.hidden = true;
+    const intl = app.viewVersion === "intl";
     elements.accountRows.innerHTML = filtered
       .map((account) => {
-        const checkin = getCheckinState(account);
+        const daily = getDailyState(account);
         const health = getHealthState(account);
         const busy = app.busyAccounts.has(account.id);
         const name = accountDisplayName(account);
         const detail = account.nickname && account.identity !== account.nickname ? account.identity : `ID: ${account.id}`;
         const reasonTooltip = account.reason ? ` data-tooltip="${escapeHTML(account.reason)}"` : "";
+        const recheckMeta = formatRecheckMeta(account);
+        const pointsMeta = recheckMeta || formatUpdatedAt(account.updatedAt);
+        const dailyActionIcon = intl ? "send-horizontal" : "calendar-check-2";
+        const dailyActionLabel = intl ? "活跃" : "签到";
 
         return `
           <tr class="${account.enabled ? "" : "is-disabled"} ${busy ? "row-busy" : ""}" data-account-id="${escapeHTML(account.id)}">
@@ -450,12 +525,12 @@
             <td data-label="状态">
               <span class="status-badge ${health.className}"${reasonTooltip}>${escapeHTML(health.label)}</span>
             </td>
-            <td data-label="今日签到">
-              <span class="checkin-label ${checkin.className}">${escapeHTML(checkin.label)}</span>
+            <td data-label="${intl ? "今日活跃" : "今日签到"}">
+              <span class="checkin-label ${daily.className}">${escapeHTML(daily.label)}</span>
             </td>
             <td data-label="积分">
               <strong class="points-value">${escapeHTML(formatPoints(account.points))}</strong>
-              <span class="points-meta">${escapeHTML(formatUpdatedAt(account.updatedAt))}</span>
+              <span class="points-meta">${escapeHTML(pointsMeta)}</span>
             </td>
             <td data-label="启用">
               <label class="switch" data-tooltip="${account.enabled ? "停用账户" : "启用账户"}">
@@ -465,8 +540,8 @@
             </td>
             <td data-label="操作">
               <div class="row-actions">
-                <button class="icon-button" type="button" data-action="checkin" aria-label="为${escapeHTML(name)}签到" data-tooltip="签到" ${busy || !account.enabled ? "disabled" : ""}>
-                  <i data-lucide="calendar-check-2" aria-hidden="true"></i>
+                <button class="icon-button" type="button" data-action="${intl ? "active" : "checkin"}" aria-label="为${escapeHTML(name)}${intl ? "发送活跃会话" : "签到"}" data-tooltip="${dailyActionLabel}" ${busy || !account.enabled ? "disabled" : ""}>
+                  <i data-lucide="${dailyActionIcon}" aria-hidden="true"></i>
                 </button>
                 <button class="icon-button" type="button" data-action="points" aria-label="查询${escapeHTML(name)}积分" data-tooltip="查询积分" ${busy || !account.enabled ? "disabled" : ""}>
                   <i data-lucide="refresh-cw" aria-hidden="true"></i>
@@ -487,12 +562,24 @@
   }
 
   function renderSchedule() {
+    const intl = currentMode() === "intl";
+    const viewIntl = app.viewVersion === "intl";
+    if (elements.versionSwitch) elements.versionSwitch.value = app.viewVersion;
+    if (elements.pageTitle) elements.pageTitle.textContent = viewIntl ? "国际版账户" : "国内版账户";
     elements.scheduleEnabled.checked = app.settings.scheduleEnabled;
     elements.scheduleTime.value = app.settings.scheduleTime;
     elements.scheduleTime.disabled = !app.settings.scheduleEnabled;
     elements.scheduleSummary.textContent = app.settings.scheduleEnabled
-      ? `每日 ${app.settings.scheduleTime} 执行`
+      ? `每日 ${app.settings.scheduleTime} 执行${intl ? "活跃任务" : "签到任务"}`
       : "当前已关闭";
+    elements.versionMode.value = app.settings.mode;
+    elements.activeModel.value = app.settings.activeModel;
+    elements.recheckDelay.value = String(app.settings.recheckDelayMinutes);
+    elements.activeModelRow.hidden = !intl;
+    elements.recheckDelayRow.hidden = !intl;
+    // 按钮文案跟随当前查看的版本列表（签到=国内列表 / 活跃=国际列表）
+    elements.runAllLabel.textContent = viewIntl ? "全部活跃" : "全部签到";
+    if (elements.colDaily) elements.colDaily.textContent = intl ? "今日活跃" : "今日签到";
   }
 
   function renderAll() {
@@ -520,7 +607,9 @@
     try {
       const payload = await api("/api/state");
       const normalized = normalizeState(payload);
-      app.accounts = normalized.accounts;
+      app.cnAccounts = normalized.cnAccounts;
+      app.intlAccounts = normalized.intlAccounts;
+      app.accounts = app.viewVersion === "intl" ? app.intlAccounts : app.cnAccounts;
       app.settings = normalized.settings;
       app.loadError = "";
       setConnection("online", "服务正常");
@@ -561,6 +650,7 @@
 
     const actionNames = {
       checkin: "签到",
+      active: "活跃会话",
       points: "积分查询",
       toggle: account.enabled ? "停用" : "启用",
       delete: "删除",
@@ -570,6 +660,8 @@
       let result;
       if (action === "checkin") {
         result = await api(`/api/accounts/${encodeURIComponent(account.id)}/checkin`, { method: "POST" });
+      } else if (action === "active") {
+        result = await api(`/api/accounts/${encodeURIComponent(account.id)}/active`, { method: "POST" });
       } else if (action === "points") {
         result = await api(`/api/accounts/${encodeURIComponent(account.id)}/points`, { method: "POST" });
       } else if (action === "toggle") {
@@ -592,24 +684,45 @@
   }
 
   async function runAllCheckins() {
+    const intl = app.viewVersion === "intl";
     if (elements.runAll.disabled || !app.accounts.some((account) => account.enabled)) {
-      if (!app.accounts.some((account) => account.enabled)) toast("没有可签到的已启用账户", "info");
+      if (!app.accounts.some((account) => account.enabled)) toast("没有可执行的已启用账户", "info");
       return;
     }
 
-    setButtonBusy(elements.runAll, true, "签到中");
+    setButtonBusy(elements.runAll, true, intl ? "活跃中" : "签到中");
     try {
       const result = await api("/api/run-all", { method: "POST" });
       const successCount = firstDefined(result?.successCount, result?.succeeded, result?.success);
       const message = typeof successCount === "number"
-        ? `批量签到完成，成功 ${integerFormatter.format(successCount)} 个账户`
-        : result?.message || "批量签到已完成";
+        ? `批量${intl ? "活跃" : "签到"}完成，成功 ${integerFormatter.format(successCount)} 个账户`
+        : result?.message || `批量${intl ? "活跃" : "签到"}已完成`;
       toast(message);
       await loadState({ quiet: true });
     } catch (error) {
-      toast(`批量签到失败：${getErrorMessage(error)}`, "error");
+      toast(`批量${intl ? "活跃" : "签到"}失败：${getErrorMessage(error)}`, "error");
     } finally {
       setButtonBusy(elements.runAll, false);
+    }
+  }
+
+  async function refreshAllPoints() {
+    if (elements.refreshPointsAll.disabled || !app.accounts.some((account) => account.enabled)) {
+      if (!app.accounts.some((account) => account.enabled)) toast("没有已启用的账户", "info");
+      return;
+    }
+    setButtonBusy(elements.refreshPointsAll, true, "刷新中");
+    try {
+      await api("/api/refresh-points", {
+        method: "POST",
+        body: JSON.stringify({ version: app.viewVersion }),
+      });
+      toast("积分已刷新");
+      await loadState({ quiet: true });
+    } catch (error) {
+      toast(`积分刷新失败：${getErrorMessage(error)}`, "error");
+    } finally {
+      setButtonBusy(elements.refreshPointsAll, false);
     }
   }
 
@@ -659,16 +772,20 @@
     event.preventDefault();
     const scheduleEnabled = elements.scheduleEnabled.checked;
     const scheduleTime = normalizeTime(elements.scheduleTime.value);
+    const mode = elements.versionMode.value === "intl" ? "intl" : "cn";
+    const activeModel = ["hy3", "hy4-preview"].includes(elements.activeModel.value) ? elements.activeModel.value : "hy3";
+    const recheckDelayMinutes = clampRecheckDelay(parseNumber(elements.recheckDelay.value) ?? 60);
     setButtonBusy(elements.saveSchedule, true, "保存中");
 
     try {
       const result = await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ scheduleEnabled, scheduleTime }),
+        body: JSON.stringify({ scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes }),
       });
-      app.settings = { scheduleEnabled, scheduleTime };
+      app.settings = { scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes };
       renderSchedule();
-      toast(result?.message || "调度设置已保存");
+      renderAll();
+      toast(result?.message || "设置已保存");
     } catch (error) {
       toast(`设置保存失败：${getErrorMessage(error)}`, "error");
       renderSchedule();
@@ -701,13 +818,19 @@
     if (!elements.loginDialog.open) elements.loginDialog.showModal();
 
     try {
-      const result = await api("/api/login/start", { method: "POST", body: JSON.stringify({}) });
+      const result = await api("/api/login/start", {
+        method: "POST",
+        body: JSON.stringify({ version: app.viewVersion }),
+      });
       app.loginId = String(firstDefined(result?.loginId, result?.id, result?.sessionId, ""));
       app.loginUrl = String(firstDefined(result?.authUrl, result?.url, result?.loginUrl, ""));
       if (!app.loginId || !app.loginUrl) throw new Error("服务未返回有效的登录信息");
 
       elements.openLoginLink.href = app.loginUrl;
       elements.loginUrlLabel.textContent = compactUrl(app.loginUrl);
+      const loginIntl = app.viewVersion === "intl";
+      const openLabel = elements.openLoginLink.querySelector("span");
+      if (openLabel) openLabel.textContent = loginIntl ? "打开 WorkBuddy 登录页" : "打开腾讯登录页";
       elements.loginPollStatus.className = "poll-status";
       elements.loginPollStatus.innerHTML = '<span class="pulse-dot" aria-hidden="true"></span><span>等待登录完成</span>';
       setLoginStage("ready");
@@ -928,10 +1051,19 @@
   function bindEvents() {
     elements.refreshState.addEventListener("click", () => loadState({ quiet: true }));
     elements.runAll.addEventListener("click", runAllCheckins);
+    elements.refreshPointsAll.addEventListener("click", refreshAllPoints);
+    // 两个版本统一走浏览器授权登录（国际版为 workbuddy.ai 授权页）
     elements.addAccount.addEventListener("click", startLogin);
     elements.search.addEventListener("input", renderAccounts);
     elements.statusFilter.addEventListener("change", renderAccounts);
     elements.scheduleForm.addEventListener("submit", saveSchedule);
+    // 页头版本切换：直接切换账号列表（国内版/国际版独立容器）
+    elements.versionSwitch.addEventListener("change", () => {
+      app.viewVersion = elements.versionSwitch.value === "intl" ? "intl" : "cn";
+      app.accounts = app.viewVersion === "intl" ? app.intlAccounts : app.cnAccounts;
+      elements.lastUpdated.textContent = `上次同步 ${timeFormatter.format(new Date())}`;
+      renderAll();
+    });
     elements.scheduleEnabled.addEventListener("change", () => {
       elements.scheduleTime.disabled = !elements.scheduleEnabled.checked;
     });

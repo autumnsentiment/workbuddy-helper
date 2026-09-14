@@ -22,6 +22,14 @@
         </a>
 
         <div class="header-actions">
+          <div class="select-field version-switch">
+            <span class="sr-only">切换版本</span>
+            <select id="version-switch" aria-label="切换版本账号列表">
+              <option value="cn">国内版</option>
+              <option value="intl">国际版</option>
+            </select>
+            <i data-lucide="chevron-down" aria-hidden="true"></i>
+          </div>
           <div class="connection-status" id="connection-status" role="status" aria-live="polite">
             <span class="status-dot" aria-hidden="true"></span>
             <span id="connection-label">正在连接</span>
@@ -42,13 +50,19 @@
       <main class="main-content" id="accounts">
         <section class="page-heading" aria-labelledby="page-title">
           <div>
-            <h1 id="page-title">账户</h1>
+            <h1 id="page-title">国内版账户</h1>
             <p id="last-updated">等待首次同步</p>
           </div>
-          <button class="button button-secondary" id="run-all" type="button">
-            <i data-lucide="calendar-check-2" aria-hidden="true"></i>
-            <span>全部签到</span>
-          </button>
+          <div class="heading-actions">
+            <button class="button button-secondary" id="refresh-points-all" type="button">
+              <i data-lucide="coins" aria-hidden="true"></i>
+              <span>一键刷新积分</span>
+            </button>
+            <button class="button button-secondary" id="run-all" type="button">
+              <i data-lucide="calendar-check-2" aria-hidden="true"></i>
+              <span id="run-all-label">全部签到</span>
+            </button>
+          </div>
         </section>
 
         <section class="summary-grid" aria-label="账户概览">
@@ -62,7 +76,7 @@
           <article class="summary-item">
             <div class="summary-icon summary-icon-green"><i data-lucide="circle-check-big" aria-hidden="true"></i></div>
             <div>
-              <span class="summary-label">今日已签到</span>
+              <span class="summary-label" id="summary-checked-label">今日已签到</span>
               <strong class="summary-value" id="summary-checked">--</strong>
             </div>
           </article>
@@ -113,7 +127,7 @@
                   <tr>
                     <th scope="col">账户</th>
                     <th scope="col">状态</th>
-                    <th scope="col">今日签到</th>
+                    <th scope="col" id="col-daily">今日签到</th>
                     <th scope="col">积分</th>
                     <th scope="col">启用</th>
                     <th class="actions-column" scope="col">操作</th>
@@ -133,16 +147,46 @@
             <div class="settings-heading">
               <div class="settings-icon"><i data-lucide="clock-3" aria-hidden="true"></i></div>
               <div>
-                <h2 id="schedule-title">自动签到</h2>
+                <h2 id="schedule-title">任务设置</h2>
                 <p id="schedule-summary">尚未读取设置</p>
               </div>
             </div>
 
             <form id="schedule-form">
+              <div class="form-row">
+                <label for="version-mode">每日任务版本</label>
+                <div class="select-field">
+                  <select id="version-mode" name="mode" aria-label="选择每日任务版本">
+                    <option value="cn">国内版 · 签到领积分</option>
+                    <option value="intl">国际版 · 活跃得积分</option>
+                  </select>
+                  <i data-lucide="chevron-down" aria-hidden="true"></i>
+                </div>
+                <p class="field-hint">定时任务按该版本执行：国内版签到对应国内账号列表，国际版活跃对应国际账号列表</p>
+              </div>
+
+              <div class="form-row" id="active-model-row" hidden>
+                <label for="active-model">活跃模型</label>
+                <div class="select-field">
+                  <select id="active-model" name="activeModel" aria-label="选择活跃对话模型">
+                    <option value="hy3">hy3</option>
+                    <option value="hy4-preview">hy4-preview</option>
+                  </select>
+                  <i data-lucide="chevron-down" aria-hidden="true"></i>
+                </div>
+                <p class="field-hint">每日对话使用该模型发起会话</p>
+              </div>
+
+              <div class="form-row" id="recheck-delay-row" hidden>
+                <label for="recheck-delay">积分复核延迟（分钟）</label>
+                <input class="text-input" id="recheck-delay" name="recheckDelayMinutes" type="number" min="5" max="720" step="5" value="60" />
+                <p class="field-hint">积分非即时到账，活跃后按此延迟自动复查（最多重试 3 次）</p>
+              </div>
+
               <div class="form-row switch-row">
                 <div>
                   <label for="schedule-enabled">启用每日任务</label>
-                <p>按北京时间执行全部账户签到</p>
+                <p>按北京时间执行全部账户</p>
                 </div>
                 <label class="switch">
                   <input id="schedule-enabled" name="scheduleEnabled" type="checkbox" />

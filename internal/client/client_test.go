@@ -77,3 +77,40 @@ func TestRefreshDoesNotFollowRedirect(t *testing.T) {
 		t.Fatalf("redirect should fail without following: calls=%d err=%v", called, err)
 	}
 }
+
+func TestActiveChatSendsClientConversation(t *testing.T) {
+	var gotPath, gotUA, gotProduct, gotAuth, gotUID, gotBody, gotIDEType string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		gotIDEType = r.Header.Get("X-IDE-Type")
+		gotPath = r.URL.Path
+		gotUA = r.Header.Get("User-Agent")
+		gotProduct = r.Header.Get("X-Product")
+		gotAuth = r.Header.Get("Authorization")
+		gotUID = r.Header.Get("X-User-Id")
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+		return response(200, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"), nil
+	})
+	err := c.ActiveChat(&model.Account{AccessToken: "at", UID: "u1", Domain: "workbuddy.ai"}, "hy4-preview")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/v2/chat/completions" {
+		t.Fatalf("path=%s", gotPath)
+	}
+	if gotUA != IntlClientUA {
+		t.Fatalf("活跃请求必须带 WorkBuddy 桌面端 UA，got=%q", gotUA)
+	}
+	if gotProduct != "SaaS" {
+		t.Fatalf("缺少客户端特征头 X-Product: %q", gotProduct)
+	}
+	if gotAuth != "Bearer at" || gotUID != "u1" {
+		t.Fatalf("auth=%q uid=%q", gotAuth, gotUID)
+	}
+	if gotIDEType != IntlClientName {
+		t.Fatalf("X-IDE-Type=%q, want %q（plans-usage 按此识别客户端）", gotIDEType, IntlClientName)
+	}
+	if !strings.Contains(gotBody, `"stream":true`) || !strings.Contains(gotBody, `"model":"hy4-preview"`) {
+		t.Fatalf("body=%s", gotBody)
+	}
+}
