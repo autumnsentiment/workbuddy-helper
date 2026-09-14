@@ -11,10 +11,12 @@
 
 FROM golang:1.23-alpine AS build
 WORKDIR /src
+ARG APP_VERSION=1.0.2
 COPY go.mod ./
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
-RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags="-s -w" \
+RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath \
+    -ldflags="-s -w -X main.appVersion=${APP_VERSION}" \
     -o /out/workbuddy-helper ./cmd/workbuddy-helper
 
 FROM alpine:3.20
