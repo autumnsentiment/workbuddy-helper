@@ -57,6 +57,12 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 	if state.Logs == nil {
 		state.Logs = []model.LogEntry{}
 	}
+	// 启动时应用已保存的代理设置（忽略坏值回退直连，坏值会在下次保存时被校验拦截）
+	if proxyURL := strings.TrimSpace(state.Settings.ProxyURL); proxyURL != "" {
+		if pc, perr := client.NewWithProxy(proxyURL); perr == nil {
+			c = pc
+		}
+	}
 	for i := range state.Accounts {
 		if state.Accounts[i].Status == "" {
 			state.Accounts[i].Status = "ready"
@@ -347,12 +353,36 @@ func (s *Service) UpdateSettings(settings model.Settings) error {
 	if delay < 5 || delay > 720 {
 		return fmt.Errorf("recheckDelayMinutes 需在 5-720 之间")
 	}
+	proxyURL := strings.TrimSpace(settings.ProxyURL)
+	if proxyURL == "" && strings.TrimSpace(settings.ProxyURL) != "" {
+		proxyURL = settings.ProxyURL // 允许显式清空之外的原样保留由前端负责
+	}
+	if proxyURL == "" {
+		proxyURL = s.state.Settings.ProxyURL // 未提供则保留（旧前端兼容）
+	}
+	if err := client.ValidateProxyURL(proxyURL); err != nil {
+		return err
+	}
 	s.state.Settings.ScheduleEnabled = settings.ScheduleEnabled
 	s.state.Settings.ScheduleTime = settings.ScheduleTime
 	s.state.Settings.Mode = mode
 	s.state.Settings.ActiveModel = activeModel
 	s.state.Settings.RecheckDelayMinutes = delay
-	return s.saveLocked()
+	s.state.Settings.ProxyURL = proxyURL
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	// 代理热更新：替换传输层但保留当前 client 的端点定制（测试注入的 upstream 等）
+	if s.client != nil {
+		transport, terr := client.NewTransportOnly(proxyURL)
+		if terr != nil {
+			return terr
+		}
+		s.client.HTTP.Transport = transport
+	} else if newClient, err := client.NewWithProxy(proxyURL); err == nil {
+		s.client = newClient
+	}
+	return nil
 }
 
 // activeModels 活跃对话可选模型（与前端下拉一致）
@@ -366,6 +396,13 @@ func validActiveModel(name string) bool {
 }
 
 // mode 返回当前版本模式：cn（每日签到）或 intl（活跃对话获取积分）
+// apiclient 返回当前上游客户端；UpdateSettings 热更新代理时原子替换。
+func (s *Service) apiclient() *client.Client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.client
+}
+
 func (s *Service) mode() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -429,7 +466,7 @@ func (s *Service) prepareAccount(id string) (model.Account, error) {
 }
 
 func (s *Service) refreshAccount(id string, a *model.Account) error {
-	if err := s.client.Refresh(a); err != nil {
+	if err := s.apiclient().Refresh(a); err != nil {
 		s.markError(id, err)
 		return err
 	}
@@ -513,10 +550,10 @@ func (s *Service) Checkin(id string) (model.PublicAccount, error) {
 		return updated.Public(), nil
 	}
 	s.markStatus(id, "running", "正在签到")
-	err = s.client.DailyCheckin(&a)
+	err = s.apiclient().DailyCheckin(&a)
 	if client.IsKind(err, client.KindAuthDead) {
 		if refreshErr := s.refreshAccount(id, &a); refreshErr == nil {
-			err = s.client.DailyCheckin(&a)
+			err = s.apiclient().DailyCheckin(&a)
 		} else {
 			return a.Public(), refreshErr
 		}
@@ -579,10 +616,10 @@ func (s *Service) ActiveChat(id string) (model.PublicAccount, error) {
 	s.markStatus(id, "running", "正在发送活跃会话")
 	// 先刷新一次积分作为基线，供延迟复核对比到账变化
 	_ = s.refreshPoints(id, a)
-	err = s.client.ActiveChat(&a, s.activeModel())
+	err = s.apiclient().ActiveChat(&a, s.activeModel())
 	if client.IsKind(err, client.KindAuthDead) {
 		if refreshErr := s.refreshAccount(id, &a); refreshErr == nil {
-			err = s.client.ActiveChat(&a, s.activeModel())
+			err = s.apiclient().ActiveChat(&a, s.activeModel())
 		} else {
 			return a.Public(), refreshErr
 		}
@@ -612,7 +649,7 @@ func (s *Service) ActiveChat(id string) (model.PublicAccount, error) {
 }
 
 func (s *Service) refreshPoints(id string, a model.Account) error {
-	result, err := s.client.Points(&a)
+	result, err := s.apiclient().Points(&a)
 	if err != nil {
 		s.markError(id, err)
 		return err

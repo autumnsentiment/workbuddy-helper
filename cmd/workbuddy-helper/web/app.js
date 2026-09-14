@@ -32,6 +32,8 @@
     versionMode: document.querySelector("#version-mode"),
     modeHint: document.querySelector("#mode-hint"),
     versionSwitch: document.querySelector("#version-switch"),
+    proxyScheme: document.querySelector("#proxy-scheme"),
+    proxyHost: document.querySelector("#proxy-host"),
     pageTitle: document.querySelector("#page-title"),
     activeModel: document.querySelector("#active-model"),
     activeModelRow: document.querySelector("#active-model-row"),
@@ -76,6 +78,7 @@
       mode: "cn",
       activeModel: "hy3",
       recheckDelayMinutes: 60,
+      proxyUrl: "",
     },
     isLoading: true,
     loadError: "",
@@ -309,8 +312,25 @@
           ? String(rawSettings.activeModel)
           : "hy3",
         recheckDelayMinutes: clampRecheckDelay(parseNumber(rawSettings.recheckDelayMinutes) ?? 60),
+        proxyUrl: String(firstDefined(rawSettings.proxyUrl, source.proxyUrl, "") || ""),
       },
     };
+  }
+
+  // 代理地址拆分：socks5://user:pass@host:port -> { scheme, host, auth }
+  function parseProxyURL(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return { scheme: "", host: "" };
+    const m = raw.match(/^(https?|socks5h?|):\/\/(.+)$/i);
+    if (!m) return { scheme: "", host: raw };
+    return { scheme: m[1].toLowerCase(), host: m[2] };
+  }
+
+  function joinProxyURL(scheme, host) {
+    scheme = String(scheme || "").trim().toLowerCase();
+    host = String(host || "").trim();
+    if (!host) return "";
+    return scheme ? `${scheme}://${host}` : host;
   }
 
   function clampRecheckDelay(value) {
@@ -575,6 +595,12 @@
     elements.versionMode.value = app.settings.mode;
     elements.activeModel.value = app.settings.activeModel;
     elements.recheckDelay.value = String(app.settings.recheckDelayMinutes);
+    const proxy = parseProxyURL(app.settings.proxyUrl);
+    elements.proxyScheme.value = proxy.scheme;
+    elements.proxyHost.value = proxy.host;
+    elements.proxyHost.placeholder = proxy.scheme
+      ? "host:port（支持认证 user:pass@host:port）"
+      : "选择协议后填写网关地址:端口（如 192.168.5.1:1070）";
     elements.activeModelRow.hidden = !intl;
     elements.recheckDelayRow.hidden = !intl;
     // 按钮文案跟随当前查看的版本列表（签到=国内列表 / 活跃=国际列表）
@@ -775,14 +801,15 @@
     const mode = elements.versionMode.value === "intl" ? "intl" : "cn";
     const activeModel = ["hy3", "hy4-preview"].includes(elements.activeModel.value) ? elements.activeModel.value : "hy3";
     const recheckDelayMinutes = clampRecheckDelay(parseNumber(elements.recheckDelay.value) ?? 60);
+    const proxyUrl = joinProxyURL(elements.proxyScheme.value, elements.proxyHost.value);
     setButtonBusy(elements.saveSchedule, true, "保存中");
 
     try {
       const result = await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes }),
+        body: JSON.stringify({ scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl }),
       });
-      app.settings = { scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes };
+      app.settings = { scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl };
       renderSchedule();
       renderAll();
       toast(result?.message || "设置已保存");

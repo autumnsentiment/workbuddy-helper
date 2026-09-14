@@ -9,10 +9,10 @@
 #   USER 10001
 # before the ENTRYPOINT to run as an unprivileged user.
 
-FROM golang:1.23-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
-ARG APP_VERSION=1.0.2
-COPY go.mod ./
+ARG APP_VERSION=1.0.3
+COPY go.mod go.sum ./
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
 RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath \

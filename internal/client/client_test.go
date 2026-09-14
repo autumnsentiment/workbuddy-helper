@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -112,5 +113,68 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, `"stream":true`) || !strings.Contains(gotBody, `"model":"hy4-preview"`) {
 		t.Fatalf("body=%s", gotBody)
+	}
+}
+
+func TestValidateProxyURL(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"", true},
+		{"http://192.168.5.1:8080", true},
+		{"https://proxy.example.com:3128", true},
+		{"socks5://192.168.5.1:1070", true},
+		{"socks5h://user:pass@gateway:1080", true},
+		{"ftp://bad.example:21", false},
+		{"not a url", false},
+		{"://missing-scheme", false},
+	}
+	for _, c := range cases {
+		err := ValidateProxyURL(c.url)
+		if (err == nil) != c.want {
+			t.Errorf("ValidateProxyURL(%q) err=%v wantOK=%v", c.url, err, c.want)
+		}
+	}
+}
+
+func TestNewWithProxySocks5Transport(t *testing.T) {
+	c, err := NewWithProxy("socks5://192.168.5.1:1070")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP == nil || c.HTTP.Transport == nil {
+		t.Fatal("expected transport")
+	}
+	if _, err := NewWithProxy("ftp://bad:21"); err == nil {
+		t.Fatal("invalid scheme should be rejected")
+	}
+	// 空代理等价直连
+	direct, err := NewWithProxy("")
+	if err != nil || direct == nil {
+		t.Fatalf("empty proxy should succeed: %v", err)
+	}
+}
+
+func TestNewWithProxyHTTPTunneling(t *testing.T) {
+	// 起一个本地 HTTP 代理，验证 http:// 代理真的被使用
+	var proxied bool
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied = true
+		if r.Method == http.MethodConnect {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer proxySrv.Close()
+	c, err := NewWithProxy(proxySrv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.ChatBaseCN = "http://upstream.invalid"
+	_, _ = c.HTTP.Get("http://upstream.invalid/x") // 结果不重要，验证是否经过代理
+	if !proxied {
+		t.Fatal("request did not go through the configured http proxy")
 	}
 }

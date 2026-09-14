@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/proxy"
+
 	"workbuddy-helper/internal/model"
 )
 
@@ -69,12 +71,89 @@ type Client struct {
 	GlobalBilling string
 }
 
+// NewWithProxy 按代理 URL 构造客户端；proxyURL 为空等价于 New()（直连）。
+// 支持协议：http:// https:// socks5:// socks5h://，可含认证 user:pass@host:port。
+// 传入不支持的协议返回错误（由上层校验拦截）。
+func NewWithProxy(proxyURL string) (*Client, error) {
+	transport, err := proxyTransport(proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	return clientFromTransport(transport), nil
+}
+
 func New() *Client {
+	return clientFromTransport(&http.Transport{
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+	})
+}
+
+func proxyTransport(proxyURL string) (*http.Transport, error) {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return &http.Transport{
+			MaxIdleConns:        32,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
+		}, nil
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("代理地址格式不正确: %w", err)
+	}
+	if !model.ValidProxyScheme(u.Scheme) {
+		return nil, fmt.Errorf("代理协议仅支持 http/https/socks5/socks5h，收到 %q", u.Scheme)
+	}
 	transport := &http.Transport{
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     90 * time.Second,
+		Proxy:               http.ProxyURL(u),
 	}
+	// socks5/socks5h 的代理握手由 x/net/proxy DialContext 完成（http.ProxyURL 只认 http/https）
+	switch u.Scheme {
+	case "socks5", "socks5h":
+		var auth *proxy.Auth
+		if u.User != nil {
+			pass, _ := u.User.Password()
+			auth = &proxy.Auth{User: u.User.Username(), Password: pass}
+		}
+		dialer, derr := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
+		if derr != nil {
+			return nil, fmt.Errorf("socks5 代理初始化失败: %w", derr)
+		}
+		transport.Proxy = nil
+		if cd, ok := dialer.(proxy.ContextDialer); ok {
+			transport.DialContext = cd.DialContext
+		}
+	}
+	return transport, nil
+}
+
+// NewTransportOnly 只构造传输层（供热更新：替换现有 client 的 Transport，保留其端点定制）。
+func NewTransportOnly(proxyURL string) (*http.Transport, error) {
+	return proxyTransport(proxyURL)
+}
+
+// ValidateProxyURL 校验代理地址：空串合法（直连）；协议必须在 http/https/socks5/socks5h 白名单。
+func ValidateProxyURL(proxyURL string) error {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return nil
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("代理地址格式不正确: %s", proxyURL)
+	}
+	if !model.ValidProxyScheme(u.Scheme) {
+		return fmt.Errorf("代理协议仅支持 http/https/socks5/socks5h，收到 %q", u.Scheme)
+	}
+	return nil
+}
+
+func clientFromTransport(transport *http.Transport) *Client {
 	return &Client{
 		HTTP: &http.Client{
 			Timeout:   30 * time.Second,

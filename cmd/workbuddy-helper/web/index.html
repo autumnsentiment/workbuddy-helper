@@ -183,6 +183,25 @@
                 <p class="field-hint">积分非即时到账，活跃后按此延迟自动复查（最多重试 3 次）</p>
               </div>
 
+              <div class="form-row">
+                <label for="proxy-scheme">网络代理</label>
+                <div class="proxy-input-row">
+                  <div class="select-field proxy-scheme-field">
+                    <span class="sr-only">代理协议</span>
+                    <select id="proxy-scheme" aria-label="代理协议">
+                      <option value="">直连</option>
+                      <option value="socks5">socks5</option>
+                      <option value="socks5h">socks5h</option>
+                      <option value="http">http</option>
+                      <option value="https">https</option>
+                    </select>
+                    <i data-lucide="chevron-down" aria-hidden="true"></i>
+                  </div>
+                  <input class="text-input" id="proxy-host" type="text" placeholder="网关地址:端口（如 192.168.5.1:1070）" autocomplete="off" />
+                </div>
+                <p class="field-hint">服务器无法直连 workbuddy.ai 时配置代理（如网关 SOCKS5）；格式 host:port，支持认证 user:pass@host:port</p>
+              </div>
+
               <div class="form-row switch-row">
                 <div>
                   <label for="schedule-enabled">启用每日任务</label>

@@ -1748,3 +1748,19 @@ select:disabled {
   padding: 7px 30px 7px 11px;
   font-weight: 650;
 }
+
+.proxy-input-row {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px;
+  align-items: center;
+}
+
+.proxy-scheme-field select {
+  width: 100%;
+  min-width: 0;
+}
+
+.proxy-input-row .text-input {
+  width: 100%;
+}

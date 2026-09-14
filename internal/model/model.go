@@ -91,6 +91,18 @@ type Settings struct {
 	ActiveModel string `json:"activeModel,omitempty"`
 	// 活跃后积分复核延迟（分钟），积分非即时到账，默认 60，可用于实测到账延迟
 	RecheckDelayMinutes int `json:"recheckDelayMinutes,omitempty"`
+	// ProxyURL 自定义代理：支持 http:// https:// socks5:// socks5h://（含认证 user:pass@host:port）
+	// 为空直连；作用于全部上游请求（国内版与国际版域名均适用）
+	ProxyURL string `json:"proxyUrl,omitempty"`
+}
+
+// ValidProxyScheme 代理协议白名单
+func ValidProxyScheme(scheme string) bool {
+	switch scheme {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	}
+	return false
 }
 
 type LogEntry struct {
