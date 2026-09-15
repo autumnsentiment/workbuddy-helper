@@ -79,7 +79,7 @@
       scheduleTime: "09:15",
       mode: "cn",
       activeModel: "hy3",
-      recheckDelayMinutes: 60,
+      recheckDelayMinutes: 840,
       proxyUrl: "",
       activePrompt: "",
     },
@@ -314,7 +314,7 @@
         activeModel: ["hy3", "hy4-preview"].includes(String(rawSettings.activeModel))
           ? String(rawSettings.activeModel)
           : "hy3",
-        recheckDelayMinutes: clampRecheckDelay(parseNumber(rawSettings.recheckDelayMinutes) ?? 60),
+        recheckDelayMinutes: clampRecheckDelay(parseNumber(rawSettings.recheckDelayMinutes) ?? 840),
         proxyUrl: String(firstDefined(rawSettings.proxyUrl, source.proxyUrl, "") || ""),
         activePrompt: String(firstDefined(rawSettings.activePrompt, source.activePrompt, "") || ""),
       },
@@ -338,8 +338,8 @@
   }
 
   function clampRecheckDelay(value) {
-    if (!Number.isFinite(value)) return 60;
-    return Math.min(720, Math.max(5, Math.round(value)));
+    if (!Number.isFinite(value)) return 840;
+    return Math.min(1440, Math.max(60, Math.round(value)));
   }
 
   function getCheckinState(account) {
@@ -807,7 +807,7 @@
     const scheduleTime = normalizeTime(elements.scheduleTime.value);
     const mode = elements.versionMode.value === "intl" ? "intl" : "cn";
     const activeModel = ["hy3", "hy4-preview"].includes(elements.activeModel.value) ? elements.activeModel.value : "hy3";
-    const recheckDelayMinutes = clampRecheckDelay(parseNumber(elements.recheckDelay.value) ?? 60);
+    const recheckDelayMinutes = clampRecheckDelay(parseNumber(elements.recheckDelay.value) ?? 840);
     const proxyUrl = joinProxyURL(elements.proxyScheme.value, elements.proxyHost.value);
     const activePrompt = elements.activePrompt.value.trim().slice(0, 200);
     setButtonBusy(elements.saveSchedule, true, "保存中");

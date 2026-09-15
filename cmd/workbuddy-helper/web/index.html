@@ -186,8 +186,8 @@
 
               <div class="form-row" id="recheck-delay-row" hidden>
                 <label for="recheck-delay">积分复核延迟（分钟）</label>
-                <input class="text-input" id="recheck-delay" name="recheckDelayMinutes" type="number" min="5" max="720" step="5" value="60" />
-                <p class="field-hint">积分非即时到账，活跃后按此延迟自动复查（最多重试 3 次）</p>
+                <input class="text-input" id="recheck-delay" name="recheckDelayMinutes" type="number" min="60" max="1440" step="30" value="840" />
+                <p class="field-hint">实测到账延迟约 14 小时（次日凌晨发放），默认 840 分钟（14h）自动复查，最多重试 6 次</p>
               </div>
 
               <div class="form-row">

@@ -49,7 +49,8 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 		state.Settings.ActiveModel = "hy3"
 	}
 	if state.Settings.RecheckDelayMinutes == 0 {
-		state.Settings.RecheckDelayMinutes = 60
+		// 实测积分到账延迟约 14 小时（次日凌晨发放），默认 840 分钟
+		state.Settings.RecheckDelayMinutes = 840
 	}
 	if state.Accounts == nil {
 		state.Accounts = []model.Account{}
@@ -350,8 +351,8 @@ func (s *Service) UpdateSettings(settings model.Settings) error {
 	if delay == 0 {
 		delay = s.state.Settings.RecheckDelayMinutes
 	}
-	if delay < 5 || delay > 720 {
-		return fmt.Errorf("recheckDelayMinutes 需在 5-720 之间")
+	if delay < 60 || delay > 1440 {
+		return fmt.Errorf("recheckDelayMinutes 需在 60-1440 之间（实测到账延迟约 14 小时）")
 	}
 	proxyURL := strings.TrimSpace(settings.ProxyURL)
 	if proxyURL == "" && strings.TrimSpace(settings.ProxyURL) != "" {
@@ -444,8 +445,8 @@ func (s *Service) recheckDelay() time.Duration {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	minutes := s.state.Settings.RecheckDelayMinutes
-	if minutes < 5 || minutes > 720 {
-		minutes = 60
+	if minutes < 60 || minutes > 1440 {
+		minutes = 840
 	}
 	return time.Duration(minutes) * time.Minute
 }
@@ -881,7 +882,7 @@ func (s *Service) recheckAccount(id string) {
 			dst.BalanceBeforeActive = 0
 		})
 		s.appendLog("info", id, fmt.Sprintf("积分已到账：%d → %d（+%d）", before, latest.Balance, delta))
-	case attempts >= 3:
+	case attempts >= 6:
 		s.updateAccount(id, func(dst *model.Account) {
 			dst.PendingRecheckAt = time.Time{}
 			dst.RecheckAttempts = attempts
