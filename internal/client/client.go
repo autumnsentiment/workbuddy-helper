@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -490,6 +491,15 @@ func (c *Client) DailyCheckin(a *model.Account) error {
 	return err
 }
 
+// newUUID v4 随机 UUID（对齐客户端 generateUUUID，带连字符）
+func newUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
 // DefaultActivePrompt 活跃会话默认消息（用户自定义留空时的兜底）
 const DefaultActivePrompt = "你是谁，谁开发你的，现在是什么时间，什么天气"
 
@@ -566,6 +576,13 @@ func chatHeaders(req *http.Request, a *model.Account) {
 		req.Header.Set("X-Domain", a.Domain)
 	}
 	req.Header.Set("X-Product", "SaaS")
+	// 会话维度头（复刻 CLI axiosToFetchAdapter）：conversation/request/message ID 均为
+	// 客户端本地生成 UUID，服务端按此登记会话；缺失时请求不被计为有效活跃会话
+	req.Header.Set("X-Conversation-ID", newUUID())
+	req.Header.Set("X-Conversation-Request-ID", strings.ReplaceAll(newUUID(), "-", ""))
+	req.Header.Set("X-Conversation-Message-ID", strings.ReplaceAll(newUUID(), "-", ""))
+	req.Header.Set("X-Request-ID", strings.ReplaceAll(newUUID(), "-", ""))
+	req.Header.Set("X-Agent-Intent", "craft")
 }
 
 type PointResult struct {
