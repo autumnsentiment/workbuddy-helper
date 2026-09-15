@@ -556,6 +556,72 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 	}
 	// 2xx：读完整个 SSE 流（max_tokens 很小，秒级结束），确保服务端完整受理本次会话
 	_, _ = io.Copy(io.Discard, resp.Body)
+
+	// 活跃判定闭环：真实客户端发完消息会上报 chat_request_send 遥测事件
+	// （POST {endpoint}/v2/report，batch 数组）。缺失该上报，服务端不记为有效活跃会话。
+	convID := req.Header.Get("X-Conversation-ID")
+	reqID := req.Header.Get("X-Conversation-Request-ID")
+	msgID := req.Header.Get("X-Conversation-Message-ID")
+	_ = c.reportChatEvent(a, prompt, modelName, convID, reqID, msgID)
+	return nil
+}
+
+// reportChatEvent 复刻 CLI StandardEventService：上报 chat_request_send 事件
+// 结构 [{code:"chat_request_send", event:{...}}]；失败不阻断活跃流程（尽力而为）。
+func (c *Client) reportChatEvent(a *model.Account, prompt, modelName, convID, reqID, msgID string) error {
+	now := time.Now().UnixMilli()
+	promptLen := 0
+	for range prompt {
+		promptLen++
+	}
+	event := map[string]any{
+		"eventCode":             "chat_request_send",
+		"timestamp":             now,
+		"reportDelay":           0,
+		"mode":                  "craft",
+		"conversationId":        convID,
+		"requestId":             reqID,
+		"inputLength":           promptLen,
+		"requestModelId":        modelName,
+		"requestModelName":      modelName,
+		"isPlan":                false,
+		"isAutoExecuteTerminal": false,
+		"isAutoModify":          false,
+		"codebaseEnable":        false,
+		"maxToken":              0,
+		"maxSteps":              0,
+		"temperature":           0,
+		"maxRetries":            0,
+		"mentionContexts":       []any{},
+		"knowledgeId":           []any{},
+		"knowledgeName":         []any{},
+		"codebaseId":            "",
+		"mentionContextCount":   0,
+		"command":               "",
+		"expertId":              "",
+		"recommendId":           "",
+		"skillId":               "",
+		"skillCount":            0,
+		"totalCount":            0,
+		"fileUri":               "",
+		"presentAt":             now,
+		"rootRequestId":         reqID,
+		"parentConversationId":  convID,
+		"agentName":             "craft",
+		"agentType":             "default",
+	}
+	body, _ := json.Marshal([]map[string]any{{"code": "chat_request_send", "event": event}})
+	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/v2/report", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	chatHeaders(req, a)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return &Error{Kind: KindTransport, Msg: err.Error()}
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
 

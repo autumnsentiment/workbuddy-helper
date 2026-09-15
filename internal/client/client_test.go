@@ -81,8 +81,17 @@ func TestRefreshDoesNotFollowRedirect(t *testing.T) {
 
 func TestActiveChatSendsClientConversation(t *testing.T) {
 	var gotPath, gotUA, gotProduct, gotAuth, gotUID, gotBody, gotIDEType string
+	var paths []string
+	var reportBody, convIDSeen string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/v2/report" {
+			raw, _ := io.ReadAll(r.Body)
+			reportBody = string(raw)
+			return response(200, `{"code":0}`), nil
+		}
 		gotIDEType = r.Header.Get("X-IDE-Type")
+		convIDSeen = r.Header.Get("X-Conversation-ID")
 		gotPath = r.URL.Path
 		gotUA = r.Header.Get("User-Agent")
 		gotProduct = r.Header.Get("X-Product")
@@ -98,6 +107,13 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	}
 	if gotPath != "/v2/chat/completions" {
 		t.Fatalf("path=%s", gotPath)
+	}
+	// 活跃闭环：chat 之后必须上报 chat_request_send 遥测事件
+	if len(paths) != 2 || paths[1] != "/v2/report" {
+		t.Fatalf("expected chat then report, got paths=%v", paths)
+	}
+	if !strings.Contains(reportBody, "chat_request_send") || !strings.Contains(reportBody, convIDSeen) {
+		t.Fatalf("report body missing event: %s", reportBody)
 	}
 	if gotUA != IntlClientUA {
 		t.Fatalf("活跃请求必须带 WorkBuddy 桌面端 UA，got=%q", gotUA)
