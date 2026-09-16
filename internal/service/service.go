@@ -83,17 +83,29 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 		appToken: token,
 		stop:     make(chan struct{}),
 	}
-	// 启动时初始化双客户端：国内版永远直连；国际版按已保存代理设置
-	// （代理仅作用于国际版域名 workbuddy.ai / codebuddy.ai 的请求）
-	if proxyURL := strings.TrimSpace(state.Settings.ProxyURL); proxyURL != "" {
-		if pc, perr := client.NewWithProxy(proxyURL); perr == nil {
+	// 启动时初始化双客户端：国内版永远直连；国际版按代理设置。
+	// 代理配置优先读 data/proxy.conf（独立明文配置，容器重建不丢），
+	// 无 conf 时回退加密 state 内的设置并回写 conf 使两者对齐。
+	proxyURL, perr := st.LoadProxyConf()
+	if perr != nil {
+		proxyURL = ""
+	}
+	if proxyURL == "" {
+		proxyURL = strings.TrimSpace(state.Settings.ProxyURL)
+		if proxyURL != "" {
+			_ = st.SaveProxyConf(proxyURL)
+		}
+	}
+	state.Settings.ProxyURL = proxyURL
+	if proxyURL != "" {
+		if pc, cerr := client.NewWithProxy(proxyURL); cerr == nil {
 			s.clientIntl = pc
 		}
 	}
 	if s.clientIntl == nil {
 		s.clientIntl = client.New()
 	}
-	s.intlProxy = strings.TrimSpace(state.Settings.ProxyURL)
+	s.intlProxy = proxyURL
 	return s, nil
 }
 
@@ -158,7 +170,16 @@ func sanitize(message string) string {
 
 func (s *Service) saveLocked() error {
 	s.state.Logs = append([]model.LogEntry(nil), s.logs...)
-	return s.store.Save(s.state)
+	if err := s.store.Save(s.state); err != nil {
+		// 持久化失败必须可见：此前静默吞掉会导致"保存后刷新回退"且无任何痕迹
+		log.Printf("state save failed: %v", err)
+		s.logs = append(s.logs, model.LogEntry{Time: time.Now(), Level: "error", Message: "数据保存失败: " + err.Error()})
+		if len(s.logs) > 300 {
+			s.logs = s.logs[len(s.logs)-300:]
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Service) getAccount(id string) (model.Account, error) {
@@ -384,6 +405,10 @@ func (s *Service) UpdateSettings(settings model.Settings) error {
 	s.state.Settings.ActivePrompt = strings.TrimSpace(settings.ActivePrompt)
 	if err := s.saveLocked(); err != nil {
 		return err
+	}
+	// 代理同步写入 data/proxy.conf（独立持久化，state 损坏/迁移后仍恢复）
+	if err := s.store.SaveProxyConf(proxyURL); err != nil {
+		s.appendLogLocked("warn", "", "代理配置文件写入失败: "+err.Error())
 	}
 	// 代理热更新：仅替换国际版客户端传输层（国内版 clientCN 永久直连，不受影响）。
 	// 端点定制（测试注入的 upstream）保留。

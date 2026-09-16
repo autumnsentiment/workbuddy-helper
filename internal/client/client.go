@@ -2,11 +2,13 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -88,6 +90,7 @@ func New() *Client {
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     90 * time.Second,
+		DialContext:         (&net.Dialer{Timeout: 15 * time.Second, Resolver: dnsFallbackResolver}).DialContext,
 	})
 }
 
@@ -98,6 +101,7 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 			MaxIdleConns:        32,
 			MaxIdleConnsPerHost: 8,
 			IdleConnTimeout:     90 * time.Second,
+			DialContext:         (&net.Dialer{Timeout: 15 * time.Second, Resolver: dnsFallbackResolver}).DialContext,
 		}, nil
 	}
 	u, err := url.Parse(proxyURL)
@@ -112,6 +116,10 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     90 * time.Second,
 		Proxy:               http.ProxyURL(u),
+		// 代理地址本身（如 socks5://192.168.5.1:1070 是 IP，域名网关也支持）
+		// 与经代理后无需本地解析；但 http 代理模式下目标域名由代理解析。
+		// 这里仍挂兜底解析器以覆盖代理主机为域名的情况。
+		DialContext: (&net.Dialer{Timeout: 15 * time.Second, Resolver: dnsFallbackResolver}).DialContext,
 	}
 	// socks5/socks5h 的代理握手由 x/net/proxy DialContext 完成（http.ProxyURL 只认 http/https）
 	switch u.Scheme {
@@ -131,6 +139,29 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 		}
 	}
 	return transport, nil
+}
+
+// dnsFallbackResolver 带兜底的解析器：系统 DNS 失败时回退公共 DNS
+// （阿里/腾讯/CF），解决容器内 Docker DNS（127.0.0.11）上游失效导致的
+// "lookup ... i/o timeout" 全量解析失败。
+var dnsFallbackResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := net.Dialer{Timeout: 5 * time.Second}
+		// 依次尝试系统地址（原样）→ 公共 DNS
+		if c, err := d.DialContext(ctx, network, address); err == nil {
+			return c, nil
+		}
+		var lastErr error
+		for _, ns := range []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"} {
+			c, err := d.DialContext(ctx, network, ns)
+			if err == nil {
+				return c, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	},
 }
 
 // NewTransportOnly 只构造传输层（供热更新：替换现有 client 的 Transport，保留其端点定制）。

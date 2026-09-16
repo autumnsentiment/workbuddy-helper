@@ -847,10 +847,21 @@
         method: "PUT",
         body: JSON.stringify({ scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl, activePrompt }),
       });
-      app.settings = { scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl, activePrompt };
+      // 以服务端权威响应为准（含代理等可能被后端规范化/保留的字段），避免刷新后回退
+      const saved = result?.settings || {};
+      app.settings = {
+        scheduleEnabled: parseBoolean(firstDefined(saved.scheduleEnabled, scheduleEnabled), false),
+        scheduleTime: normalizeTime(firstDefined(saved.scheduleTime, scheduleTime)),
+        mode: String(firstDefined(saved.mode, mode)) === "intl" ? "intl" : "cn",
+        activeModel: ["hy3", "hy4-preview"].includes(String(saved.activeModel)) ? String(saved.activeModel) : activeModel,
+        recheckDelayMinutes: clampRecheckDelay(parseNumber(saved.recheckDelayMinutes) ?? recheckDelayMinutes),
+        proxyUrl: String(firstDefined(saved.proxyUrl, proxyUrl, "") || ""),
+        activePrompt: String(firstDefined(saved.activePrompt, activePrompt, "") || ""),
+      };
       renderSchedule();
       renderAll();
-      toast(result?.message || "设置已保存");
+      const proxyLabel = app.settings.proxyUrl ? `代理 ${app.settings.proxyUrl}` : "直连";
+      toast(`设置已保存并持久化（国际版${proxyLabel}）`);
     } catch (error) {
       toast(`设置保存失败：${getErrorMessage(error)}`, "error");
       renderSchedule();
