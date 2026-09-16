@@ -755,7 +755,11 @@
 
     setButtonBusy(elements.runAll, true, intl ? "活跃中" : "签到中");
     try {
-      const result = await api("/api/run-all", { method: "POST" });
+      // 按当前查看的版本列表执行：cn=全部签到，intl=全部活跃
+      const result = await api("/api/run-all", {
+        method: "POST",
+        body: JSON.stringify({ version: app.viewVersion }),
+      });
       const successCount = firstDefined(result?.successCount, result?.succeeded, result?.success);
       const message = typeof successCount === "number"
         ? `批量${intl ? "活跃" : "签到"}完成，成功 ${integerFormatter.format(successCount)} 个账户`

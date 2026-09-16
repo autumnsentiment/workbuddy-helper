@@ -233,12 +233,19 @@ func TestRunAllUsesActiveChatInIntlMode(t *testing.T) {
 	if err := svc.updateAccount("a1", func(a *model.Account) { a.Version = model.ModeIntl }); err != nil {
 		t.Fatal(err)
 	}
-	results := svc.RunAll()
+	results := svc.RunAll(model.ModeIntl)
 	if len(results) != 1 || chats != 1 || checkins != 0 {
 		t.Fatalf("results=%d chats=%d checkins=%d", len(results), chats, checkins)
 	}
 	if results[0].LastActive != "confirmed" {
 		t.Fatalf("unexpected result: %+v", results[0])
+	}
+
+	// 指定 cn 版本时：intl 账号不参与，不应再触发活跃
+	chats = 0
+	cnResults := svc.RunAll(model.ModeCN)
+	if len(cnResults) != 0 || chats != 0 {
+		t.Fatalf("cn run-all should skip intl accounts: results=%d chats=%d", len(cnResults), chats)
 	}
 }
 

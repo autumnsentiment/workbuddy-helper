@@ -751,12 +751,18 @@ func (s *Service) Points(id string) (model.PublicAccount, error) {
 	return updated.Public(), nil
 }
 
-func (s *Service) RunAll() []model.PublicAccount {
-	mode := s.mode()
+// RunAll 对指定版本的启用账号批量执行：cn=全部签到，intl=全部活跃。
+// version 必须为 cn/intl（前端按当前查看的版本列表传入）；
+// 非法值回退每日任务版本（兼容旧调用方）。
+func (s *Service) RunAll(version string) []model.PublicAccount {
+	if version != model.ModeCN && version != model.ModeIntl {
+		version = s.mode()
+	}
+	mode := version
 	s.mu.RLock()
 	ids := make([]string, 0, len(s.state.Accounts))
 	for _, a := range s.state.Accounts {
-		// 版本切换 = 切换账号列表：只对当前版本列表执行
+		// 版本切换 = 切换账号列表：只对指定版本列表执行
 		if a.Enabled && s.accountVersion(a) == mode {
 			ids = append(ids, a.ID)
 		}
@@ -857,12 +863,13 @@ func (s *Service) runScheduledIfDue() {
 	if settings.LastScheduledDay == day {
 		return
 	}
-	if s.mode() == model.ModeIntl {
+	taskMode := s.mode()
+	if taskMode == model.ModeIntl {
 		s.appendLog("info", "", "开始执行每日批量活跃任务")
 	} else {
 		s.appendLog("info", "", "开始执行每日批量签到和积分刷新")
 	}
-	s.RunAll()
+	s.RunAll(taskMode)
 	s.mu.Lock()
 	s.state.Settings.LastScheduledDay = day
 	_ = s.saveLocked()

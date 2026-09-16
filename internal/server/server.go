@@ -205,8 +205,13 @@ func errorsAs(err error, target any) bool {
 	return errors.As(err, target)
 }
 
-func (s *Server) handleRunAll(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": s.service.RunAll()})
+func (s *Server) handleRunAll(w http.ResponseWriter, r *http.Request) {
+	// 按前端当前查看的版本列表执行：cn=全部签到，intl=全部活跃
+	var body struct {
+		Version string `json:"version"`
+	}
+	_ = decodeJSON(r, &body)
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": s.service.RunAll(strings.TrimSpace(body.Version))})
 }
 
 func (s *Server) handleRefreshPoints(w http.ResponseWriter, r *http.Request) {
