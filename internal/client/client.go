@@ -526,9 +526,11 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 		"model":      modelName,
 		"stream":     true,
 		"max_tokens": maxTokens,
-		"messages": []map[string]string{
+		// 对齐真实客户端消息格式：user content 为 typed block 数组
+		// （convertUserTextBlock -> {type:"text",text:...}）
+		"messages": []map[string]any{
 			{"role": "system", "content": "You are a helpful assistant."},
-			{"role": "user", "content": prompt},
+			{"role": "user", "content": []map[string]string{{"type": "text", "text": prompt}}},
 		},
 	})
 	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/v2/chat/completions", bytes.NewReader(body))

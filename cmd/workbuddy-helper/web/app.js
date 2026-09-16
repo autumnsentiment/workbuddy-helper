@@ -38,6 +38,7 @@
     activeModel: document.querySelector("#active-model"),
     activeModelRow: document.querySelector("#active-model-row"),
     activePrompt: document.querySelector("#active-prompt"),
+    proxyRow: document.querySelector("#proxy-row"),
     activePromptRow: document.querySelector("#active-prompt-row"),
     recheckDelay: document.querySelector("#recheck-delay"),
     recheckDelayRow: document.querySelector("#recheck-delay-row"),
@@ -610,9 +611,38 @@
     elements.activeModelRow.hidden = !viewIntl;
     elements.activePromptRow.hidden = !viewIntl;
     elements.recheckDelayRow.hidden = !viewIntl;
+    if (elements.proxyRow) elements.proxyRow.hidden = !viewIntl;
     // 按钮文案跟随当前查看的版本列表（签到=国内列表 / 活跃=国际列表）
     elements.runAllLabel.textContent = viewIntl ? "全部活跃" : "全部签到";
     if (elements.colDaily) elements.colDaily.textContent = intl ? "今日活跃" : "今日签到";
+  }
+
+  // 设置面板草稿：切版本/刷新时不丢用户未保存的编辑
+  function readSettingsDraft() {
+    if (!elements.scheduleForm) return null;
+    return {
+      scheduleEnabled: elements.scheduleEnabled.checked,
+      scheduleTime: elements.scheduleTime.value,
+      mode: elements.versionMode.value,
+      activeModel: elements.activeModel.value,
+      activePrompt: elements.activePrompt.value,
+      recheckDelay: elements.recheckDelay.value,
+      proxyScheme: elements.proxyScheme.value,
+      proxyHost: elements.proxyHost.value,
+    };
+  }
+
+  function writeSettingsDraft(draft) {
+    if (!draft) return;
+    elements.scheduleEnabled.checked = draft.scheduleEnabled;
+    elements.scheduleTime.value = draft.scheduleTime;
+    elements.scheduleTime.disabled = !draft.scheduleEnabled;
+    elements.versionMode.value = draft.mode;
+    elements.activeModel.value = draft.activeModel;
+    elements.activePrompt.value = draft.activePrompt;
+    elements.recheckDelay.value = draft.recheckDelay;
+    elements.proxyScheme.value = draft.proxyScheme;
+    elements.proxyHost.value = draft.proxyHost;
   }
 
   function renderAll() {
@@ -1094,10 +1124,13 @@
     elements.scheduleForm.addEventListener("submit", saveSchedule);
     // 页头版本切换：直接切换账号列表（国内版/国际版独立容器）
     elements.versionSwitch.addEventListener("change", () => {
+      // 保留用户在设置面板中未保存的编辑，避免切版本/刷新时被回显值冲掉
+      const draft = readSettingsDraft();
       app.viewVersion = elements.versionSwitch.value === "intl" ? "intl" : "cn";
       app.accounts = app.viewVersion === "intl" ? app.intlAccounts : app.cnAccounts;
       elements.lastUpdated.textContent = `上次同步 ${timeFormatter.format(new Date())}`;
       renderAll();
+      writeSettingsDraft(draft);
     });
     elements.scheduleEnabled.addEventListener("change", () => {
       elements.scheduleTime.disabled = !elements.scheduleEnabled.checked;

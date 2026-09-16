@@ -18,11 +18,16 @@ import (
 var locChina = time.FixedZone("Asia/Shanghai", 8*60*60)
 
 type Service struct {
-	mu         sync.RWMutex
-	accounts   map[string]*sync.Mutex
-	state      model.State
-	store      *store.Store
-	client     *client.Client
+	mu       sync.RWMutex
+	accounts map[string]*sync.Mutex
+	state    model.State
+	store    *store.Store
+	// clientCN 国内版链路客户端：永久直连，不受代理设置影响
+	clientCN *client.Client
+	// clientIntl 国际版链路客户端：按设置走代理（可为直连），可热替换
+	clientIntl *client.Client
+	// intlProxy 当前国际版代理 URL（""=直连）
+	intlProxy  string
 	logs       []model.LogEntry
 	loginMu    sync.Mutex
 	logins     map[string]*client.LoginSession
@@ -58,12 +63,6 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 	if state.Logs == nil {
 		state.Logs = []model.LogEntry{}
 	}
-	// 启动时应用已保存的代理设置（忽略坏值回退直连，坏值会在下次保存时被校验拦截）
-	if proxyURL := strings.TrimSpace(state.Settings.ProxyURL); proxyURL != "" {
-		if pc, perr := client.NewWithProxy(proxyURL); perr == nil {
-			c = pc
-		}
-	}
 	for i := range state.Accounts {
 		if state.Accounts[i].Status == "" {
 			state.Accounts[i].Status = "ready"
@@ -77,13 +76,24 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 		accounts: make(map[string]*sync.Mutex),
 		state:    state,
 		store:    st,
-		client:   c,
+		clientCN: c,
 		logs:     append([]model.LogEntry(nil), state.Logs...),
 		logins:   make(map[string]*client.LoginSession),
 		loginAt:  make(map[string]time.Time),
 		appToken: token,
 		stop:     make(chan struct{}),
 	}
+	// 启动时初始化双客户端：国内版永远直连；国际版按已保存代理设置
+	// （代理仅作用于国际版域名 workbuddy.ai / codebuddy.ai 的请求）
+	if proxyURL := strings.TrimSpace(state.Settings.ProxyURL); proxyURL != "" {
+		if pc, perr := client.NewWithProxy(proxyURL); perr == nil {
+			s.clientIntl = pc
+		}
+	}
+	if s.clientIntl == nil {
+		s.clientIntl = client.New()
+	}
+	s.intlProxy = strings.TrimSpace(state.Settings.ProxyURL)
 	return s, nil
 }
 
@@ -354,12 +364,13 @@ func (s *Service) UpdateSettings(settings model.Settings) error {
 	if delay < 60 || delay > 1440 {
 		return fmt.Errorf("recheckDelayMinutes 需在 60-1440 之间（实测到账延迟约 14 小时）")
 	}
+	// 代理仅作用于国际版链路；未提供时保留现有设置（旧前端兼容）
 	proxyURL := strings.TrimSpace(settings.ProxyURL)
 	if proxyURL == "" && strings.TrimSpace(settings.ProxyURL) != "" {
-		proxyURL = settings.ProxyURL // 允许显式清空之外的原样保留由前端负责
+		proxyURL = settings.ProxyURL
 	}
 	if proxyURL == "" {
-		proxyURL = s.state.Settings.ProxyURL // 未提供则保留（旧前端兼容）
+		proxyURL = s.state.Settings.ProxyURL
 	}
 	if err := client.ValidateProxyURL(proxyURL); err != nil {
 		return err
@@ -374,16 +385,18 @@ func (s *Service) UpdateSettings(settings model.Settings) error {
 	if err := s.saveLocked(); err != nil {
 		return err
 	}
-	// 代理热更新：替换传输层但保留当前 client 的端点定制（测试注入的 upstream 等）
-	if s.client != nil {
+	// 代理热更新：仅替换国际版客户端传输层（国内版 clientCN 永久直连，不受影响）。
+	// 端点定制（测试注入的 upstream）保留。
+	if s.clientIntl != nil {
 		transport, terr := client.NewTransportOnly(proxyURL)
 		if terr != nil {
 			return terr
 		}
-		s.client.HTTP.Transport = transport
+		s.clientIntl.HTTP.Transport = transport
 	} else if newClient, err := client.NewWithProxy(proxyURL); err == nil {
-		s.client = newClient
+		s.clientIntl = newClient
 	}
+	s.intlProxy = proxyURL
 	return nil
 }
 
@@ -398,11 +411,15 @@ func validActiveModel(name string) bool {
 }
 
 // mode 返回当前版本模式：cn（每日签到）或 intl（活跃对话获取积分）
-// apiclient 返回当前上游客户端；UpdateSettings 热更新代理时原子替换。
-func (s *Service) apiclient() *client.Client {
+// apiclient 按账号域名返回对应客户端：国内版域名永远直连（clientCN），
+// 国际版域名走 clientIntl（代理可热更新）。
+func (s *Service) apiclientFor(a *model.Account) *client.Client {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.client
+	if model.IsGlobalDomain(a.Domain) {
+		return s.clientIntl
+	}
+	return s.clientCN
 }
 
 func (s *Service) mode() string {
@@ -475,7 +492,7 @@ func (s *Service) prepareAccount(id string) (model.Account, error) {
 }
 
 func (s *Service) refreshAccount(id string, a *model.Account) error {
-	if err := s.apiclient().Refresh(a); err != nil {
+	if err := s.apiclientFor(a).Refresh(a); err != nil {
 		s.markError(id, err)
 		return err
 	}
@@ -559,10 +576,10 @@ func (s *Service) Checkin(id string) (model.PublicAccount, error) {
 		return updated.Public(), nil
 	}
 	s.markStatus(id, "running", "正在签到")
-	err = s.apiclient().DailyCheckin(&a)
+	err = s.apiclientFor(&a).DailyCheckin(&a)
 	if client.IsKind(err, client.KindAuthDead) {
 		if refreshErr := s.refreshAccount(id, &a); refreshErr == nil {
-			err = s.apiclient().DailyCheckin(&a)
+			err = s.apiclientFor(&a).DailyCheckin(&a)
 		} else {
 			return a.Public(), refreshErr
 		}
@@ -626,10 +643,10 @@ func (s *Service) ActiveChat(id string, force bool) (model.PublicAccount, error)
 	s.markStatus(id, "running", "正在发送活跃会话")
 	// 先刷新一次积分作为基线，供延迟复核对比到账变化
 	_ = s.refreshPoints(id, a)
-	err = s.apiclient().ActiveChat(&a, s.activeModel(), s.activePrompt())
+	err = s.apiclientFor(&a).ActiveChat(&a, s.activeModel(), s.activePrompt())
 	if client.IsKind(err, client.KindAuthDead) {
 		if refreshErr := s.refreshAccount(id, &a); refreshErr == nil {
-			err = s.apiclient().ActiveChat(&a, s.activeModel(), s.activePrompt())
+			err = s.apiclientFor(&a).ActiveChat(&a, s.activeModel(), s.activePrompt())
 		} else {
 			return a.Public(), refreshErr
 		}
@@ -666,7 +683,7 @@ func (s *Service) ActiveChat(id string, force bool) (model.PublicAccount, error)
 }
 
 func (s *Service) refreshPoints(id string, a model.Account) error {
-	result, err := s.apiclient().Points(&a)
+	result, err := s.apiclientFor(&a).Points(&a)
 	if err != nil {
 		s.markError(id, err)
 		return err
@@ -743,24 +760,17 @@ func (s *Service) RunAll() []model.PublicAccount {
 }
 
 // RefreshAllPoints 一键刷新已启用账户的积分（不执行签到/活跃）。
-// version 为空刷新全部；为 cn/intl 时只刷新对应版本账号列表（与前端当前查看版本一致）。
+// version 必须为 cn 或 intl：严格只刷新该版本账号列表（与前端当前查看版本一致），
+// 绝不波及另一版本；非法/缺失值按 cn 处理（不会跨版本刷新）。
 func (s *Service) RefreshAllPoints(version string) []model.PublicAccount {
+	if version != model.ModeIntl {
+		version = model.ModeCN
+	}
 	s.mu.RLock()
 	ids := make([]string, 0, len(s.state.Accounts))
 	for _, a := range s.state.Accounts {
-		if !a.Enabled {
-			continue
-		}
-		if version == model.ModeCN || version == model.ModeIntl {
-			// 指定版本：只刷新该版本列表
-			if s.accountVersion(a) == version {
-				ids = append(ids, a.ID)
-			}
-		} else {
-			// 未指定：刷新当前任务版本列表
-			if s.accountVersion(a) == s.mode() {
-				ids = append(ids, a.ID)
-			}
+		if a.Enabled && s.accountVersion(a) == version {
+			ids = append(ids, a.ID)
 		}
 	}
 	s.mu.RUnlock()
