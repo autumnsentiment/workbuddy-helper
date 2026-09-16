@@ -557,11 +557,14 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 		"model":      modelName,
 		"stream":     true,
 		"max_tokens": maxTokens,
-		// 对齐真实客户端消息格式：user content 为 typed block 数组
-		// （convertUserTextBlock -> {type:"text",text:...}）
+		// 对齐真实客户端消息格式：用户提问包 <user_query> 标签
+		// （UserQueryInterceptor: `${prefix} <user_query> ${text} </user_query>`），
+		// content 为 typed block 数组；服务端扣费页据此提取请求内容展示。
 		"messages": []map[string]any{
 			{"role": "system", "content": "You are a helpful assistant."},
-			{"role": "user", "content": []map[string]string{{"type": "text", "text": prompt}}},
+			{"role": "user", "content": []map[string]string{
+				{"type": "text", "text": "<user_query> " + prompt + " </user_query>"},
+			}},
 		},
 	})
 	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/v2/chat/completions", bytes.NewReader(body))
