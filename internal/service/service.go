@@ -83,6 +83,15 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 		appToken: token,
 		stop:     make(chan struct{}),
 	}
+	// 固定 DNS：读 data/dns.conf（默认公共 DNS），国内版链路与解析兜底共用。
+	// 容器内 Docker DNS 瘫痪时国内版仍可解析连接。
+	if dnsServers, derr := st.LoadDNSConf(); derr == nil && len(dnsServers) > 0 {
+		client.SetDNSConfig(dnsServers)
+	} else if derr == nil {
+		// 无 dns.conf：以代码内默认公共 DNS 落盘（保证容器 DNS 故障时仍可解析）
+		client.SetDNSConfig(nil)
+		_ = st.SaveDNSConf(client.ActiveDNS())
+	}
 	// 启动时初始化双客户端：国内版永远直连；国际版按代理设置。
 	// 代理配置优先读 data/proxy.conf（独立明文配置，容器重建不丢），
 	// 无 conf 时回退加密 state 内的设置并回写 conf 使两者对齐。
@@ -106,6 +115,11 @@ func New(st *store.Store, c *client.Client) (*Service, error) {
 		s.clientIntl = client.New()
 	}
 	s.intlProxy = proxyURL
+	// 国内版链路：独立 transport（固定 DNS + 永直连），不与代理/系统 DNS 耦合；
+	// 调用方定制过 transport（测试 upstream）时保留原客户端
+	if cnClient := client.NewWithCNTransport(c); cnClient != nil {
+		s.clientCN = cnClient
+	}
 	return s, nil
 }
 

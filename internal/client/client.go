@@ -13,6 +13,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -90,7 +91,7 @@ func New() *Client {
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     90 * time.Second,
-		DialContext:         (&net.Dialer{Timeout: 15 * time.Second, Resolver: dnsFallbackResolver}).DialContext,
+		DialContext:         dnsFallbackResolver.DialContext,
 	})
 }
 
@@ -101,7 +102,7 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 			MaxIdleConns:        32,
 			MaxIdleConnsPerHost: 8,
 			IdleConnTimeout:     90 * time.Second,
-			DialContext:         (&net.Dialer{Timeout: 15 * time.Second, Resolver: dnsFallbackResolver}).DialContext,
+			DialContext:         dnsFallbackResolver.DialContext,
 		}, nil
 	}
 	u, err := url.Parse(proxyURL)
@@ -118,8 +119,8 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 		Proxy:               http.ProxyURL(u),
 		// 代理地址本身（如 socks5://192.168.5.1:1070 是 IP，域名网关也支持）
 		// 与经代理后无需本地解析；但 http 代理模式下目标域名由代理解析。
-		// 这里仍挂兜底解析器以覆盖代理主机为域名的情况。
-		DialContext: (&net.Dialer{Timeout: 15 * time.Second, Resolver: dnsFallbackResolver}).DialContext,
+		// 这里仍挂兜底拨号以覆盖代理主机为域名的情况。
+		DialContext: dnsFallbackResolver.DialContext,
 	}
 	// socks5/socks5h 的代理握手由 x/net/proxy DialContext 完成（http.ProxyURL 只认 http/https）
 	switch u.Scheme {
@@ -141,32 +142,152 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 	return transport, nil
 }
 
-// dnsFallbackResolver 带兜底的解析器：系统 DNS 失败时回退公共 DNS
-// （阿里/腾讯/CF），解决容器内 Docker DNS（127.0.0.11）上游失效导致的
-// "lookup ... i/o timeout" 全量解析失败。
-var dnsFallbackResolver = &net.Resolver{
-	PreferGo: true,
-	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-		d := net.Dialer{Timeout: 5 * time.Second}
-		// 依次尝试系统地址（原样）→ 公共 DNS
-		if c, err := d.DialContext(ctx, network, address); err == nil {
-			return c, nil
-		}
-		var lastErr error
-		for _, ns := range []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"} {
-			c, err := d.DialContext(ctx, network, ns)
-			if err == nil {
-				return c, nil
+// publicDNS 公共 DNS 兜底列表（容器内 Docker DNS 127.0.0.11 上游失效时使用）
+var publicDNS = []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"}
+
+// fixedResolver 固定 DNS 解析器：跳过系统 resolv.conf，直接向指定 DNS 发查询。
+// 用于国内版链路（DNS 可写 data/dns.conf 固定公共 DNS，容器 DNS 故障不影响）。
+func fixedResolver(servers []string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 4 * time.Second}
+			var lastErr error
+			for _, ns := range servers {
+				c, err := d.DialContext(ctx, network, ns)
+				if err == nil {
+					return c, nil
+				}
+				lastErr = err
 			}
-			lastErr = err
+			return nil, lastErr
+		},
+	}
+}
+
+// defaultDNS 默认固定公共 DNS（可被 data/dns.conf 覆盖）
+var defaultDNS = []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"}
+
+// SetDNSConfig 运行时更新固定 DNS（来自 data/dns.conf）。
+// 影响之后新建的 transport；已存在的 transport 由调用方重建。
+var dnsMu sync.Mutex
+var activeDNS = defaultDNS
+
+func SetDNSConfig(servers []string) {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+	if len(servers) > 0 {
+		activeDNS = servers
+	} else {
+		activeDNS = append([]string(nil), defaultDNS...)
+	}
+}
+
+// ActiveDNS 返回当前固定 DNS 列表
+func ActiveDNS() []string {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+	return append([]string(nil), activeDNS...)
+}
+
+// dnsFallbackResolver 兜底解析器：优先系统路径，解析失败时用固定公共 DNS 重查。
+// 注意不能只在 Dial 层切换服务器——系统服务器可达但查询超时时 dial 是成功的，
+// 因此这里在解析层做两级尝试：先用系统 resolver，失败再用固定 DNS 解析出 IP。
+var dnsFallbackResolver = &fallbackResolver{}
+
+type fallbackResolver struct{}
+
+func (r *fallbackResolver) resolve(ctx context.Context, host string) ([]net.IP, error) {
+	// 第一级：系统解析（容器内为 Docker DNS）
+	if ips, err := net.DefaultResolver.LookupIPAddr(ctx, host); err == nil && len(ips) > 0 {
+		addrs := make([]net.IP, 0, len(ips))
+		for _, ip := range ips {
+			addrs = append(addrs, ip.IP)
 		}
-		return nil, lastErr
-	},
+		return addrs, nil
+	}
+	// 第二级：固定公共 DNS
+	dnsMu.Lock()
+	servers := append([]string(nil), activeDNS...)
+	dnsMu.Unlock()
+	res := fixedResolver(servers)
+	ips, err := res.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	addrs := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		addrs = append(addrs, ip.IP)
+	}
+	return addrs, nil
+}
+
+// DialContext 拨号：解析（带兜底）后直连 IP
+func (r *fallbackResolver) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	// IP 直接过
+	if ip := net.ParseIP(host); ip != nil {
+		d := net.Dialer{Timeout: 15 * time.Second}
+		return d.DialContext(ctx, network, address)
+	}
+	d := net.Dialer{Timeout: 15 * time.Second}
+	ips, err := r.resolve(ctx, host)
+	if err != nil || len(ips) == 0 {
+		// 解析彻底失败：交回系统路径，返回原始错误
+		return d.DialContext(ctx, network, address)
+	}
+	var lastErr error
+	for _, ip := range ips {
+		conn, dialErr := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	return nil, lastErr
 }
 
 // NewTransportOnly 只构造传输层（供热更新：替换现有 client 的 Transport，保留其端点定制）。
 func NewTransportOnly(proxyURL string) (*http.Transport, error) {
 	return proxyTransport(proxyURL)
+}
+
+// NewWithCNTransport 国内版专用客户端：固定 DNS 直连（无代理）。
+// callerTransport 定制过（测试注入 upstream）时返回 nil，调用方保留原客户端。
+func NewWithCNTransport(caller *Client) *Client {
+	if caller != nil && caller.HTTP != nil && caller.HTTP.Transport != nil {
+		if _, isDefault := caller.HTTP.Transport.(*http.Transport); !isDefault {
+			return nil // 外部定制了 transport（RoundTripper 接口），保留
+		}
+	}
+	c := New()
+	c.HTTP.Transport = NewCNTransport()
+	// 保留调用方的端点定制（测试注入的 ChatBaseCN 等）
+	if caller != nil {
+		c.ChatBaseCN = caller.ChatBaseCN
+		c.BillingBaseCN = caller.BillingBaseCN
+		c.GlobalBase = caller.GlobalBase
+		c.GlobalBilling = caller.GlobalBilling
+	}
+	return c
+}
+
+// NewCNTransport 国内版专用传输层：纯固定 DNS 直连（绝不使用系统 DNS 与代理）。
+// DNS 服务器来自 data/dns.conf（默认公共 DNS），域名解析全部走固定服务器，
+// 容器内 Docker DNS（127.0.0.11）瘫痪也不影响国内版链路。
+func NewCNTransport() *http.Transport {
+	res := fixedResolver(ActiveDNS())
+	dialer := &net.Dialer{Timeout: 15 * time.Second, Resolver: res}
+	return &http.Transport{
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext:         dialer.DialContext,
+		Proxy:               nil, // 国内版永远直连
+	}
 }
 
 // ValidateProxyURL 校验代理地址：空串合法（直连）；协议必须在 http/https/socks5/socks5h 白名单。
