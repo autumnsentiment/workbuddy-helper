@@ -406,6 +406,9 @@
     if (["needs_login", "unauthorized", "expired", "auth_dead"].includes(account.healthRaw)) {
       return { key: "attention", label: "登录失效", className: "status-error" };
     }
+    if (["credits_exhausted"].includes(account.healthRaw)) {
+      return { key: "attention", label: "积分耗尽", className: "status-warn" };
+    }
     if (["running", "pending"].includes(account.healthRaw)) {
       return { key: "attention", label: "执行中", className: "status-warn" };
     }

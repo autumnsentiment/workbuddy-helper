@@ -314,6 +314,8 @@ func statusFor(err error) int {
 	switch {
 	case client.IsKind(err, client.KindAuthDead):
 		return http.StatusUnauthorized
+	case client.IsKind(err, client.KindCredit):
+		return http.StatusPaymentRequired
 	case client.IsKind(err, client.KindRate):
 		return http.StatusTooManyRequests
 	case client.IsKind(err, client.KindServer), client.IsKind(err, client.KindTransport):
@@ -329,6 +331,8 @@ func friendlyError(err error) string {
 		switch ce.Kind {
 		case client.KindAuthDead:
 			return "登录已失效，请删除后重新添加该账号"
+		case client.KindCredit:
+			return "积分已耗尽，请先获取积分（等待每日活跃奖励到账或购买套餐）后再试"
 		case client.KindRate:
 			return "请求过于频繁，请稍后再试"
 		case client.KindServer:

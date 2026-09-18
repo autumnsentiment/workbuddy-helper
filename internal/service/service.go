@@ -553,6 +553,8 @@ func (s *Service) markError(id string, err error) {
 	switch {
 	case client.IsKind(err, client.KindAuthDead):
 		status = "needs_login"
+	case client.IsKind(err, client.KindCredit):
+		status = "credits_exhausted"
 	case client.IsKind(err, client.KindRate):
 		status = "rate_limited"
 	}

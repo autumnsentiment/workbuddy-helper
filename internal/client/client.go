@@ -40,6 +40,7 @@ type Kind string
 
 const (
 	KindAuthDead  Kind = "auth_dead"
+	KindCredit    Kind = "credits_exhausted"
 	KindRate      Kind = "rate_limited"
 	KindNotFound  Kind = "not_found"
 	KindServer    Kind = "server_error"
@@ -403,11 +404,27 @@ func (c *Client) doEnvelope(req *http.Request) (json.RawMessage, int, error) {
 	return env.Data, resp.StatusCode, nil
 }
 
+// isCreditExhausted 判断响应是否表示积分耗尽（余额不足而非限流）
+func isCreditExhausted(code int, msg string) bool {
+	if code == 14018 {
+		return true
+	}
+	lower := strings.ToLower(msg)
+	for _, marker := range []string{"credits exhausted", "insufficient credit", "no credit", "quota exceeded", "积分不足", "余额不足", "额度不足"} {
+		if strings.Contains(lower, strings.ToLower(marker)) || strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func classifyHTTP(status int, body string) error {
 	msg := short(body, 180)
 	switch {
 	case status == http.StatusUnauthorized || strings.Contains(body, "12153") || strings.Contains(strings.ToLower(body), "offline user session"):
 		return &Error{Kind: KindAuthDead, Status: status, Msg: msg}
+	case isCreditExhausted(0, body):
+		return &Error{Kind: KindCredit, Status: status, Msg: msg}
 	case status == http.StatusTooManyRequests:
 		return &Error{Kind: KindRate, Status: status, Msg: msg}
 	case status == http.StatusNotFound:
@@ -425,6 +442,8 @@ func classifyBusiness(status, code int, msg string) error {
 		return &Error{Kind: KindAuthDead, Status: status, Code: code, Msg: msg}
 	}
 	switch {
+	case isCreditExhausted(code, msg):
+		return &Error{Kind: KindCredit, Status: status, Code: code, Msg: msg}
 	case status == http.StatusTooManyRequests:
 		return &Error{Kind: KindRate, Status: status, Code: code, Msg: msg}
 	case status == http.StatusNotFound:
@@ -674,10 +693,30 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 	if r := []rune(prompt); len(r) > 40 {
 		maxTokens = 160
 	}
+	// 会话 ID：客户端本地生成（用于 growthEvent.id 与请求头，服务端据此登记活跃）
+	convID := newUUID()
+	reqID := strings.ReplaceAll(newUUID(), "-", "")
+	// growthEvent：真实客户端（WorkBuddy 桌面场景）把 chat_request_send 事件
+	// 以 JSON 字符串放在请求体 extra_vars.growthEvent 随对话一起上报——
+	// 服务端从该字段读取活跃事件（独立 /v2/report 不是桌面端路径）。
+	growthEvents := []map[string]any{{
+		"eventCode": "chat_request_send",
+		"id":        convID,
+		"extra": map[string]any{
+			"inputLength":      len([]rune(prompt)),
+			"requestModelId":   modelName,
+			"requestModelName": modelName,
+			"mode":             "craft",
+			"command":          "",
+			"expertId":         "",
+		},
+	}}
+	growthJSON, _ := json.Marshal(growthEvents)
 	body, _ := json.Marshal(map[string]any{
 		"model":      modelName,
 		"stream":     true,
 		"max_tokens": maxTokens,
+		"extra_vars": map[string]any{"growthEvent": string(growthJSON)},
 		// 对齐真实客户端消息格式：用户提问包 <user_query> 标签
 		// （UserQueryInterceptor: `${prefix} <user_query> ${text} </user_query>`），
 		// content 为 typed block 数组；服务端扣费页据此提取请求内容展示。
@@ -693,6 +732,8 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 		return err
 	}
 	chatHeaders(req, a)
+	req.Header.Set("X-Conversation-ID", convID)
+	req.Header.Set("X-Conversation-Request-ID", reqID)
 	req.Header.Set("Accept", "text/event-stream")
 	if isGlobal(a.Domain) {
 		// 活跃记录按客户端识别：必须带 WorkBuddy 桌面端特征（X-IDE-* + 客户端 UA），
@@ -714,12 +755,9 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 	// 2xx：读完整个 SSE 流（max_tokens 很小，秒级结束），确保服务端完整受理本次会话
 	_, _ = io.Copy(io.Discard, resp.Body)
 
-	// 活跃判定闭环：真实客户端发完消息会上报 chat_request_send 遥测事件
-	// （POST {endpoint}/v2/report，batch 数组）。缺失该上报，服务端不记为有效活跃会话。
-	convID := req.Header.Get("X-Conversation-ID")
-	reqID := req.Header.Get("X-Conversation-Request-ID")
-	msgID := req.Header.Get("X-Conversation-Message-ID")
-	_ = c.reportChatEvent(a, prompt, modelName, convID, reqID, msgID)
+	// 备用通道：桌面端主路径是请求体 extra_vars.growthEvent（上方已带），
+	// 这里再补一次独立遥测上报（部分服务端路径从 /v2/report 读取），失败不阻断。
+	_ = c.reportChatEvent(a, prompt, modelName, convID, reqID, req.Header.Get("X-Conversation-Message-ID"))
 	return nil
 }
 
