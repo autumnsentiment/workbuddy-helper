@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -662,6 +664,24 @@ func (c *Client) DailyCheckin(a *model.Account) error {
 	return err
 }
 
+// machineID 返回稳定的本机标识（对齐客户端 machineId：机器级 UUID，进程内缓存）
+var machineIDOnce sync.Once
+var machineIDValue string
+
+func machineID() string {
+	machineIDOnce.Do(func() {
+		// 优先读取宿主已注入的 CLIENT_INFO_MACHINE_ID（与真实客户端同源）
+		if v := strings.TrimSpace(os.Getenv("CLIENT_INFO_MACHINE_ID")); v != "" {
+			machineIDValue = v
+			return
+		}
+		// 回退：按主机名+用户名派生稳定哈希（保证同一部署下不变）
+		host, _ := os.Hostname()
+		machineIDValue = fmt.Sprintf("%x", sha256.Sum256([]byte("workbuddy-helper:"+host)))
+	})
+	return machineIDValue
+}
+
 // newUUID v4 随机 UUID（对齐客户端 generateUUUID，带连字符）
 func newUUID() string {
 	b := make([]byte, 16)
@@ -770,9 +790,26 @@ func (c *Client) reportChatEvent(a *model.Account, prompt, modelName, convID, re
 		promptLen++
 	}
 	event := map[string]any{
-		"eventCode":             "chat_request_send",
-		"timestamp":             now,
-		"reportDelay":           0,
+		"eventCode":   "chat_request_send",
+		"timestamp":   now,
+		"reportDelay": 0,
+		// telemetryClientInfo 展开字段（对齐桌面端 ACP _meta 注入的 15 字段，
+		// CLI 的 telemetry_client_info_event_processor 会将其展开进事件；
+		// 缺少这些字段服务端可能不认定为桌面端活跃会话）
+		"ideType":               IntlClientName,
+		"ideName":               IntlClientName,
+		"ideVersion":            IntlClientVer,
+		"machineId":             machineID(),
+		"sessionId":             convID,
+		"userId":                a.UID,
+		"username":              a.Nickname,
+		"userNickname":          a.Nickname,
+		"enterpriseId":          a.EnterpriseID,
+		"extName":               "workbuddy-desktop",
+		"extVersion":            IntlClientVer,
+		"downloadChannel":       "official",
+		"userAgent":             IntlClientUA,
+		"featureModule":         "",
 		"mode":                  "craft",
 		"conversationId":        convID,
 		"requestId":             reqID,
@@ -810,7 +847,16 @@ func (c *Client) reportChatEvent(a *model.Account, prompt, modelName, convID, re
 	if err != nil {
 		return err
 	}
-	chatHeaders(req, a)
+	// 标准事件服务头（对齐 CLI StandardEventService：仅 Authorization + Content-Type，
+	// 产品配置未下发自定义 report headers）
+	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	if a.Domain != "" {
+		req.Header.Set("X-Domain", a.Domain)
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return &Error{Kind: KindTransport, Msg: err.Error()}
