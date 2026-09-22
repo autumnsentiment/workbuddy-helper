@@ -1,9 +1,13 @@
 package store
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"workbuddy-helper/internal/model"
 )
 
 // ExportPortableFrom decrypts a state.bin at an explicit source path (using the
@@ -11,7 +15,18 @@ import (
 // portable key-file encrypted copy into dstDir. It returns the number of
 // accounts exported. Used by the native exe to prepare data for a container.
 func ExportPortableFrom(srcFile, dstDir string) (int, error) {
+	srcDir := filepath.Dir(srcFile)
+	dstFile := filepath.Join(dstDir, "state.bin")
+	if srcInfo, err := os.Stat(srcFile); err == nil {
+		if dstInfo, dstErr := os.Stat(dstFile); dstErr == nil && os.SameFile(srcInfo, dstInfo) {
+			return 0, fmt.Errorf("export destination must differ from the source data directory")
+		}
+	}
 	state, err := readStateFile(srcFile)
+	if err != nil {
+		return 0, err
+	}
+	configs, err := readOptionalConfigs(srcDir)
 	if err != nil {
 		return 0, err
 	}
@@ -24,10 +39,39 @@ func ExportPortableFrom(srcFile, dstDir string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := writeRaw(dstDir, filepath.Join(dstDir, "state.bin"), raw); err != nil {
+	if err := writeRaw(dstDir, dstFile, raw); err != nil {
 		return 0, err
 	}
+	for name, content := range configs {
+		if err := writeConfigFile(filepath.Join(dstDir, name), content); err != nil {
+			return 0, fmt.Errorf("copy %s: %w", name, err)
+		}
+	}
 	return len(state.Accounts), nil
+}
+
+// readOptionalConfigs captures the small plaintext settings that are not part
+// of encrypted state.bin. Keeping them in a portable export prevents a custom
+// DNS list or an explicit "direct" proxy override from being lost during a
+// Windows-to-container migration.
+func readOptionalConfigs(srcDir string) (map[string][]byte, error) {
+	configs := make(map[string][]byte)
+	for _, name := range []string{ProxyConfFileName, DNSConfFileName} {
+		path := filepath.Join(srcDir, name)
+		exists, err := inspectRegularFile(path, name)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			continue
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		configs[name] = content
+	}
+	return configs, nil
 }
 
 // ImportInto merges accounts from a source data directory (srcDir must contain
@@ -45,23 +89,57 @@ func ImportInto(srcDir, dstDir string) (int, error) {
 		return 0, fmt.Errorf("read destination data: %w", err)
 	}
 	existing := make(map[string]bool, len(dstState.Accounts))
+	existingIDs := make(map[string]bool, len(dstState.Accounts))
 	for _, a := range dstState.Accounts {
-		existing[a.UID] = true
+		if a.UID != "" {
+			existing[accountImportKey(a)] = true
+		}
+		if a.ID != "" {
+			existingIDs[a.ID] = true
+		}
 	}
-	added := 0
+	toImport := make([]model.Account, 0, len(srcState.Accounts))
 	for _, a := range srcState.Accounts {
-		if a.UID == "" || existing[a.UID] {
+		key := accountImportKey(a)
+		if a.UID == "" || existing[key] {
 			continue
 		}
-		dstState.Accounts = append(dstState.Accounts, a)
-		existing[a.UID] = true
-		added++
+		if a.ID == "" || existingIDs[a.ID] {
+			a.ID, err = uniqueAccountID(existingIDs)
+			if err != nil {
+				return 0, err
+			}
+		}
+		existing[key] = true
+		existingIDs[a.ID] = true
+		toImport = append(toImport, a)
 	}
-	if added == 0 {
+	if len(toImport) == 0 {
 		return 0, nil
 	}
+	if len(dstState.Accounts)+len(toImport) > 50 {
+		return 0, fmt.Errorf("import would exceed the 50-account limit (existing %d, new %d)", len(dstState.Accounts), len(toImport))
+	}
+	dstState.Accounts = append(dstState.Accounts, toImport...)
 	if err := dst.Save(dstState); err != nil {
 		return 0, fmt.Errorf("write merged state: %w", err)
 	}
-	return added, nil
+	return len(toImport), nil
+}
+
+func accountImportKey(a model.Account) string {
+	return a.VersionMode() + "\x00" + a.UID
+}
+
+func uniqueAccountID(existing map[string]bool) (string, error) {
+	for {
+		raw := make([]byte, 12)
+		if _, err := rand.Read(raw); err != nil {
+			return "", fmt.Errorf("generate imported account id: %w", err)
+		}
+		id := hex.EncodeToString(raw)
+		if !existing[id] {
+			return id, nil
+		}
+	}
 }

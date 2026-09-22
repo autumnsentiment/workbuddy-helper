@@ -92,6 +92,12 @@
     loginPollTimer: null,
     loginPollGeneration: 0,
     editingAccountId: "",
+    proxyDirty: false,
+    proxyRevision: 0,
+    settingsDirty: false,
+    settingsRevision: 0,
+    stateLoadGeneration: 0,
+    stateLoads: 0,
   };
 
   const numberFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
@@ -248,10 +254,15 @@
     const healthRaw = String(firstDefined(raw?.status, raw?.health, raw?.tokenStatus, "")).toLowerCase();
     const reason = String(firstDefined(raw?.reason, raw?.lastError, raw?.error, raw?.message, raw?.statusMessage, ""));
 
+    const rawDomain = String(raw?.domain || "").trim().toLowerCase();
+    const inferredVersion = raw?.region === "global" || rawDomain === "workbuddy.ai" || rawDomain.endsWith(".workbuddy.ai")
+      ? "intl"
+      : "cn";
+
     return {
       ...raw,
       id,
-      version: String(firstDefined(raw?.version, raw?.region === "global" ? "intl" : "cn", "cn")),
+      version: String(firstDefined(raw?.version, inferredVersion, "cn")),
       displayName,
       nickname,
       identity,
@@ -334,8 +345,17 @@
   function joinProxyURL(scheme, host) {
     scheme = String(scheme || "").trim().toLowerCase();
     host = String(host || "").trim();
-    if (!host) return "";
-    return scheme ? `${scheme}://${host}` : host;
+    if (!scheme) return "";
+    return host ? `${scheme}://${host}` : "";
+  }
+
+  function syncProxyInput({ clearDirect = false } = {}) {
+    const direct = !elements.proxyScheme.value;
+    if (direct && clearDirect) elements.proxyHost.value = "";
+    elements.proxyHost.disabled = direct;
+    elements.proxyHost.placeholder = direct
+      ? "直连模式不需要代理地址"
+      : "host:port（支持认证 user:pass@host:port）";
   }
 
   function clampRecheckDelay(value) {
@@ -607,9 +627,7 @@
     const proxy = parseProxyURL(app.settings.proxyUrl);
     elements.proxyScheme.value = proxy.scheme;
     elements.proxyHost.value = proxy.host;
-    elements.proxyHost.placeholder = proxy.scheme
-      ? "host:port（支持认证 user:pass@host:port）"
-      : "选择协议后填写网关地址:端口（如 192.168.5.1:1070）";
+    syncProxyInput();
     // 活跃模型/提示词/复核延迟跟随当前查看的版本列表显示（切到国际版即可见、可改）
     elements.activeModelRow.hidden = !viewIntl;
     elements.activePromptRow.hidden = !viewIntl;
@@ -617,7 +635,7 @@
     if (elements.proxyRow) elements.proxyRow.hidden = !viewIntl;
     // 按钮文案跟随当前查看的版本列表（签到=国内列表 / 活跃=国际列表）
     elements.runAllLabel.textContent = viewIntl ? "全部活跃" : "全部签到";
-    if (elements.colDaily) elements.colDaily.textContent = intl ? "今日活跃" : "今日签到";
+    if (elements.colDaily) elements.colDaily.textContent = viewIntl ? "今日活跃" : "今日签到";
   }
 
   // 设置面板草稿：切版本/刷新时不丢用户未保存的编辑
@@ -646,6 +664,7 @@
     elements.recheckDelay.value = draft.recheckDelay;
     elements.proxyScheme.value = draft.proxyScheme;
     elements.proxyHost.value = draft.proxyHost;
+    syncProxyInput();
   }
 
   function renderAll() {
@@ -661,6 +680,9 @@
   }
 
   async function loadState({ quiet = false } = {}) {
+    const generation = ++app.stateLoadGeneration;
+    const settingsRevision = app.settingsRevision;
+    app.stateLoads += 1;
     if (!quiet) {
       app.isLoading = true;
       app.loadError = "";
@@ -672,24 +694,36 @@
 
     try {
       const payload = await api("/api/state");
+      if (generation !== app.stateLoadGeneration) return;
       const normalized = normalizeState(payload);
       app.cnAccounts = normalized.cnAccounts;
       app.intlAccounts = normalized.intlAccounts;
       app.accounts = app.viewVersion === "intl" ? app.intlAccounts : app.cnAccounts;
-      app.settings = normalized.settings;
+      if (settingsRevision === app.settingsRevision) {
+        app.settings = normalized.settings;
+        if (!app.settingsDirty) app.proxyDirty = false;
+      }
       app.loadError = "";
       setConnection("online", "服务正常");
       elements.lastUpdated.textContent = `上次同步 ${timeFormatter.format(new Date())}`;
     } catch (error) {
+      if (generation !== app.stateLoadGeneration) return;
       app.loadError = getErrorMessage(error, "请确认本地服务正在运行");
       setConnection("error", "连接失败");
       elements.lastUpdated.textContent = "同步失败";
       if (quiet) toast(app.loadError, "error");
     } finally {
-      app.isLoading = false;
-      elements.refreshState.classList.remove("is-spinning");
-      elements.refreshState.disabled = false;
-      renderAll();
+      app.stateLoads = Math.max(0, app.stateLoads - 1);
+      if (app.stateLoads === 0) {
+        elements.refreshState.classList.remove("is-spinning");
+        elements.refreshState.disabled = false;
+      }
+      if (generation === app.stateLoadGeneration) {
+        const draft = app.settingsDirty ? readSettingsDraft() : null;
+        app.isLoading = false;
+        renderAll();
+        if (draft) writeSettingsDraft(draft);
+      }
     }
   }
 
@@ -826,7 +860,7 @@
     try {
       const result = await api(`/api/accounts/${encodeURIComponent(account.id)}`, {
         method: "PUT",
-        body: JSON.stringify({ enabled: account.enabled, nickname }),
+        body: JSON.stringify({ nickname }),
       });
       toast(result?.message || "账户名称已更新");
       closeEditDialog();
@@ -845,17 +879,31 @@
     const mode = elements.versionMode.value === "intl" ? "intl" : "cn";
     const activeModel = ["hy3", "hy4-preview"].includes(elements.activeModel.value) ? elements.activeModel.value : "hy3";
     const recheckDelayMinutes = clampRecheckDelay(parseNumber(elements.recheckDelay.value) ?? 840);
+    if (elements.proxyScheme.value && !elements.proxyHost.value.trim()) {
+      toast("请填写代理网关地址和端口", "error");
+      elements.proxyHost.focus();
+      return;
+    }
     const proxyUrl = joinProxyURL(elements.proxyScheme.value, elements.proxyHost.value);
     const activePrompt = elements.activePrompt.value.trim().slice(0, 200);
+    const settingsRevision = app.settingsRevision;
+    const proxyRevision = app.proxyRevision;
     setButtonBusy(elements.saveSchedule, true, "保存中");
 
     try {
+      const settingsPayload = { scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, activePrompt };
+      // 公开设置会隐藏代理认证信息。只有用户实际编辑过代理字段时才提交，
+      // 避免保存其他设置时用脱敏 URL 覆盖 data/proxy.conf 中的真实凭据。
+      if (app.proxyDirty) settingsPayload.proxyUrl = proxyUrl;
       const result = await api("/api/settings", {
         method: "PUT",
-        body: JSON.stringify({ scheduleEnabled, scheduleTime, mode, activeModel, recheckDelayMinutes, proxyUrl, activePrompt }),
+        body: JSON.stringify(settingsPayload),
       });
       // 以服务端权威响应为准（含代理等可能被后端规范化/保留的字段），避免刷新后回退
       const saved = result?.settings || {};
+      const hasNewerDraft = app.settingsRevision !== settingsRevision;
+      const hasNewerProxyDraft = app.proxyRevision !== proxyRevision;
+      const newerDraft = hasNewerDraft ? readSettingsDraft() : null;
       app.settings = {
         scheduleEnabled: parseBoolean(firstDefined(saved.scheduleEnabled, scheduleEnabled), false),
         scheduleTime: normalizeTime(firstDefined(saved.scheduleTime, scheduleTime)),
@@ -865,13 +913,15 @@
         proxyUrl: String(firstDefined(saved.proxyUrl, proxyUrl, "") || ""),
         activePrompt: String(firstDefined(saved.activePrompt, activePrompt, "") || ""),
       };
-      renderSchedule();
+      app.proxyDirty = hasNewerProxyDraft;
+      app.settingsDirty = hasNewerDraft;
+      app.settingsRevision += 1;
       renderAll();
-      const proxyLabel = app.settings.proxyUrl ? `代理 ${app.settings.proxyUrl}` : "直连";
+      writeSettingsDraft(newerDraft);
+      const proxyLabel = app.settings.proxyUrl ? "代理已启用" : "直连";
       toast(`设置已保存并持久化（国际版${proxyLabel}）`);
     } catch (error) {
       toast(`设置保存失败：${getErrorMessage(error)}`, "error");
-      renderSchedule();
     } finally {
       setButtonBusy(elements.saveSchedule, false);
     }
@@ -895,6 +945,8 @@
 
   async function startLogin() {
     stopLoginPolling();
+    const generation = app.loginPollGeneration;
+    const loginVersion = app.viewVersion;
     app.loginId = "";
     app.loginUrl = "";
     setLoginStage("starting");
@@ -903,22 +955,24 @@
     try {
       const result = await api("/api/login/start", {
         method: "POST",
-        body: JSON.stringify({ version: app.viewVersion }),
+        body: JSON.stringify({ version: loginVersion }),
       });
+      if (generation !== app.loginPollGeneration || !elements.loginDialog.open) return;
       app.loginId = String(firstDefined(result?.loginId, result?.id, result?.sessionId, ""));
       app.loginUrl = String(firstDefined(result?.authUrl, result?.url, result?.loginUrl, ""));
       if (!app.loginId || !app.loginUrl) throw new Error("服务未返回有效的登录信息");
 
       elements.openLoginLink.href = app.loginUrl;
       elements.loginUrlLabel.textContent = compactUrl(app.loginUrl);
-      const loginIntl = app.viewVersion === "intl";
+      const loginIntl = loginVersion === "intl";
       const openLabel = elements.openLoginLink.querySelector("span");
       if (openLabel) openLabel.textContent = loginIntl ? "打开 WorkBuddy 登录页" : "打开腾讯登录页";
       elements.loginPollStatus.className = "poll-status";
       elements.loginPollStatus.innerHTML = '<span class="pulse-dot" aria-hidden="true"></span><span>等待登录完成</span>';
       setLoginStage("ready");
-      pollLogin(app.loginPollGeneration);
+      pollLogin(generation);
     } catch (error) {
+      if (generation !== app.loginPollGeneration || !elements.loginDialog.open) return;
       setLoginStage("error", getErrorMessage(error));
     }
   }
@@ -958,7 +1012,7 @@
         toast(result?.message || "账户添加成功");
         await loadState({ quiet: true });
         window.setTimeout(() => {
-          if (elements.loginDialog.open) elements.loginDialog.close();
+          if (generation === app.loginPollGeneration && elements.loginDialog.open) elements.loginDialog.close();
         }, 700);
         return;
       }
@@ -973,6 +1027,10 @@
       app.loginPollTimer = window.setTimeout(() => pollLogin(generation), 1800);
     } catch (error) {
       if (generation !== app.loginPollGeneration) return;
+      if ([400, 401, 403, 404, 409, 410].includes(error?.status)) {
+        setLoginStage("error", getErrorMessage(error, "登录会话已过期，请重试"));
+        return;
+      }
       elements.loginPollStatus.className = "poll-status is-error";
       elements.loginPollStatus.innerHTML = `<span class="pulse-dot" aria-hidden="true"></span><span>${escapeHTML(getErrorMessage(error, "状态查询失败，正在重试"))}</span>`;
       app.loginPollTimer = window.setTimeout(() => pollLogin(generation), 3000);
@@ -1151,7 +1209,34 @@
       writeSettingsDraft(draft);
     });
     elements.scheduleEnabled.addEventListener("change", () => {
+      app.settingsDirty = true;
+      app.settingsRevision += 1;
       elements.scheduleTime.disabled = !elements.scheduleEnabled.checked;
+    });
+    elements.scheduleForm.addEventListener("input", (event) => {
+      if (event.target !== elements.proxyHost) {
+        app.settingsDirty = true;
+        app.settingsRevision += 1;
+      }
+    });
+    elements.scheduleForm.addEventListener("change", (event) => {
+      if (event.target !== elements.proxyScheme && event.target !== elements.scheduleEnabled) {
+        app.settingsDirty = true;
+        app.settingsRevision += 1;
+      }
+    });
+    elements.proxyScheme.addEventListener("change", () => {
+      app.proxyDirty = true;
+      app.proxyRevision += 1;
+      app.settingsDirty = true;
+      app.settingsRevision += 1;
+      syncProxyInput({ clearDirect: true });
+    });
+    elements.proxyHost.addEventListener("input", () => {
+      app.proxyDirty = true;
+      app.proxyRevision += 1;
+      app.settingsDirty = true;
+      app.settingsRevision += 1;
     });
 
     elements.accountRows.addEventListener("click", (event) => {

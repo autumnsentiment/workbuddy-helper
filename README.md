@@ -36,7 +36,7 @@
   - **国际版**（workbuddy.ai）：每日积分按"活跃账号"发放——当天至少发起一次对话即视为活跃；国际账号列表。请求完全对齐国际版客户端逆向结果：
     - 端点 `https://www.workbuddy.ai/v2/chat/completions`（流式，system 消息必须在前，否则 400 code=11128）
     - 客户端特征头：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` UA + `X-IDE-Type/Name: WorkBuddy` + `X-Product: SaaS` + `X-User-Id` + `X-Domain`（逆向自国际版客户端 CLIENT_INFO 注入链路，plans-usage 页识别为 WorkBuddy 客户端）
-    - 模型可选 `hy3` / `hy4-preview`（`max_tokens=16`，几乎不消耗积分）
+    - 模型可选 `hy3` / `hy4-preview`；活跃请求按提示词长度使用 `max_tokens=64`，较长提示词使用 `160`，避免回答被截断
     - 积分查询走 `https://www.codebuddy.ai/v2/billing/meter/get-user-resource`（实测 credits 单位）
     - 国际版账号通过「添加账户」在 WorkBuddy 登录页完成浏览器授权——授权页为 `https://www.workbuddy.ai/login?platform=workbuddy-ai&state=...`（对齐国际版客户端登录链路：state → 授权页 → token 轮询 → account，全部走 workbuddy.ai 同域）。
   - **积分延迟复核**：国际版积分非即时到账（**实测延迟约 14 小时，次日凌晨发放**），活跃成功后按设置延迟（默认 840 分钟=14h，可调 60-1440）自动复查积分变化，无变化最多重试 6 次（覆盖约 3.5 天）；日志记录"活跃前 → 活跃后"的积分增量。
@@ -67,7 +67,7 @@
 
 ## 下载免安装版（Windows）
 
-不想自己编译的话，直接到 Releases 下载单文件程序（当前版本 **v1.0.5**）：
+不想自己编译的话，直接到 Releases 下载单文件程序（最新已发布版本 **v1.0.6**）：
 
 | 文件 | 说明 |
 |---|---|
@@ -110,7 +110,7 @@ certutil -hashfile WorkBuddyHelper-windows-amd64.exe SHA256
 docker build -t workbuddy-helper:latest .
 ```
 
-镜像采用多阶段构建：`golang:1.23-alpine` 编译 → `alpine:3.20` 运行，静态二进制、体积小、无外部 Go 依赖。
+镜像采用多阶段构建：`golang:1.26-alpine` 编译 → `alpine:3.20` 运行，静态二进制、体积小。首次构建会按 `go.mod` 下载 Go 模块依赖，运行镜像不携带 Go 工具链。
 
 ### 2. 启动容器
 
@@ -145,7 +145,9 @@ docker run -d --name workbuddy-helper --restart unless-stopped \
 | 仅本机 | `0.0.0.0` | `127.0.0.1:18080:18080` | 容器内监听全部网卡，但宿主机只绑回环，外部不可达 |
 | 局域网 | `0.0.0.0` | `18080:18080` | 局域网内均可访问 |
 
-> **安全提示**：看板本身**没有登录口令**，且其中包含账号令牌。若映射到 `0.0.0.0`，请确保仅在**受信任的内网**使用，或自行在前置 Nginx 上加认证。
+> **安全提示**：看板本身**没有登录口令**，且其中包含账号令牌。若映射到 `0.0.0.0`，请确保仅在**受信任的内网**使用，或自行在前置 Nginx 上加认证；通过反向代理域名访问时，同时设置 `WBH_ALLOWED_HOSTS`，例如 `panel.example.com:8443`。
+
+也可以直接启用内置 Basic Auth：同时设置 `WBH_AUTH_USER` 与 `WBH_AUTH_PASSWORD`。浏览器首次访问会弹出登录框；`/healthz` 保留匿名访问供 Docker 健康检查使用。Basic Auth 本身不加密传输，跨网络访问时仍应放在 HTTPS 反向代理后。密码不会写入 `state.bin`，请通过容器环境变量或 secret 注入，不要提交到仓库。
 
 > **注意**：容器内 `WBH_HOST` 必须为 `0.0.0.0`，否则 Docker 端口映射（DNAT 到容器 eth0）无法投递到仅监听回环的进程。
 
@@ -162,10 +164,15 @@ curl -s http://127.0.0.1:18080/healthz
 
 在界面右侧打开「自动签到」并设置北京时间（默认 `09:15`）。容器需保持运行；`restart: unless-stopped` 会随 Docker 自动重启。
 
-也可用一次性模式（适合外部 cron）：
+也可用一次性模式（适合外部 cron）。由于数据目录有单实例锁，不能在常驻容器运行时直接 `docker exec` 启动第二个进程；请先停止常驻服务，再用临时容器执行：
 
 ```bash
-docker exec workbuddy-helper /app/workbuddy-helper --once
+docker compose stop
+docker run --rm --name workbuddy-helper-once \
+  -e TZ=Asia/Shanghai -e WBH_DATA=/data \
+  -v "$PWD/data:/data" \
+  workbuddy-helper:latest --once --no-open
+docker compose start
 ```
 
 ---
@@ -179,7 +186,7 @@ workbuddy-helper [选项]
   --port 18080             指定监听端口（默认 0 = 自动选择空闲端口）
   --host 127.0.0.1         监听地址（默认 127.0.0.1；容器内需设为 0.0.0.0）
   --data-dir DIR           指定数据目录
-  --once                   对所有启用账号执行一次签到后退出
+  --once                   按当前每日任务版本对所有启用账号执行一次签到或活跃后退出
   --export-portable DIR    导出当前数据为可移植副本（供 Docker 使用）
   --import DIR             从 DIR 导入账号到数据目录（按 UID 去重）
 ```
@@ -192,6 +199,9 @@ workbuddy-helper [选项]
 |---|---|---|
 | `WBH_DATA` | Windows：`%LOCALAPPDATA%\WorkBuddyHelper`<br>容器：`/data` | 数据目录 |
 | `WBH_HOST` | `127.0.0.1` | 监听地址；容器内需为 `0.0.0.0` |
+| `WBH_ALLOWED_HOSTS` | 空 | 反向代理域名白名单，逗号分隔（例如 `panel.example.com:8443`）；通配监听默认只接受 IP/localhost |
+| `WBH_AUTH_USER` | 空 | 内置 Basic Auth 用户名；需与 `WBH_AUTH_PASSWORD` 同时设置才启用 |
+| `WBH_AUTH_PASSWORD` | 空 | 内置 Basic Auth 密码；建议通过 Docker secret 或受保护的环境注入 |
 | `TZ` | 容器内 `Asia/Shanghai` | 时区（定时任务按北京时间计算，内部固定使用 UTC+8） |
 
 ---
@@ -204,6 +214,8 @@ workbuddy-helper [选项]
 |---|---|
 | `state.bin` | 账号、令牌、积分、日志（加密存储） |
 | `key.bin` | 容器/Linux 端的 256 位随机密钥（`0600` 权限） |
+| `proxy.conf` | 国际版代理地址；`direct` 表示直连（明文，可能包含代理用户名和密码） |
+| `dns.conf` | 国内版固定 DNS 列表；`system` 表示使用系统 DNS |
 | `instance.lock` | 进程锁，防止同一数据目录被多个进程同时写入 |
 
 ### 两种加密后端
@@ -219,6 +231,9 @@ workbuddy-helper [选项]
 
 > **重要**：`key.bin` 与 `state.bin` 必须成对备份。`key.bin` 丢失后 `state.bin` 将**无法解密**，只能重新添加账号。
 
+> **代理凭据**：`proxy.conf` 为便于容器启动恢复而采用明文保存。若代理 URL 含 `user:pass@`，请限制 `data` 目录权限，不要提交到 Git、镜像或公开备份。
+> Web/API 回显会移除代理用户名和密码；保存其他设置时不会覆盖文件中的认证信息，只有实际编辑代理字段才会更新它。
+
 ---
 
 ## 账号迁移（Windows ↔ 容器）
@@ -231,7 +246,7 @@ DPAPI 数据绑定 Windows 用户/机器，**Linux 容器无法直接解密**。
 WorkBuddyHelper.exe --export-portable D:\wbh-data
 ```
 
-该命令会解密当前 `state.bin`，用**新生成的 `key.bin`** 以 `WBK1` 格式重新加密写入 `D:\wbh-data`。
+该命令会解密当前 `state.bin`，用**新生成的 `key.bin`** 以 `WBK1` 格式重新加密写入 `D:\wbh-data`；如果源目录存在 `proxy.conf` 或 `dns.conf`，也会一并复制到可移植目录。
 
 ### 2. 在容器中挂载
 
@@ -250,13 +265,13 @@ docker run -d --name workbuddy-helper --restart unless-stopped \
 WorkBuddyHelper.exe --import D:\wbh-data
 ```
 
-> 迁移时请确保 `key.bin` 与 `state.bin` **一同复制**，缺一不可。
+> 迁移时请确保 `key.bin` 与 `state.bin` **一同复制**，缺一不可。`proxy.conf` / `dns.conf` 是可选配置文件；其中 `proxy.conf` 可能包含代理认证信息，请按敏感凭据保护。
 
 ---
 
 ## 从源码构建
 
-需要 **Go 1.22+**，模块**无任何外部依赖**（仅标准库）。
+需要 **Go 1.26+**；构建时会按 `go.mod` 下载 `golang.org/x/net` 模块依赖。
 
 ```bash
 # 运行测试与静态检查
@@ -309,9 +324,11 @@ workbuddy-helper/
 | GET | `/api/logs?limit=` | 运行日志 |
 | POST | `/api/login/start` | 开始登录（返回授权 URL） |
 | POST | `/api/login/poll` | 轮询登录结果 |
-| POST | `/api/run-all` | 全部账号签到 |
+| POST | `/api/run-all` | 执行当前版本全部账号任务（国内版签到 / 国际版活跃） |
+| POST | `/api/refresh-points` | 刷新当前版本全部账号积分 |
 | PUT | `/api/settings` | 更新定时设置 |
 | POST | `/api/accounts/{id}/checkin` | 单账号签到 |
+| POST | `/api/accounts/{id}/active` | 单账号发送国际版活跃会话 |
 | POST | `/api/accounts/{id}/points` | 单账号积分刷新 |
 | PUT | `/api/accounts/{id}` | 修改显示名 / 启停 |
 | DELETE | `/api/accounts/{id}` | 删除账号 |
@@ -323,7 +340,7 @@ workbuddy-helper/
 ## 常见问题
 
 **Q：界面提示"请求来源不受信任"？**
-A：这是 CSRF 保护。请通过浏览器访问页面（而非直接调 API），并确认 `Origin` 与访问地址同源。若通过反向代理访问，请确保代理正确透传 `Host` 头。
+A：这是本地会话与 CSRF 保护。请通过浏览器访问页面（而非直接调 API），并确认 `Origin` 与访问地址同源。若通过反向代理访问，请确保代理正确透传 `Host` 头，并把外部域名加入 `WBH_ALLOWED_HOSTS`。
 
 **Q：容器启动后宿主机访问不了？**
 A：容器内 `WBH_HOST` 必须是 `0.0.0.0`。若为 `127.0.0.1`，Docker 端口映射无法投递。
@@ -340,6 +357,19 @@ A：签到与积分使用 WorkBuddy 客户端当前调用的 billing 接口；�
 ---
 
 ## 更新日志
+
+### v1.0.6（2026-09-23）
+
+- 修复代理保存后页面刷新回退、无法显式切回直连，以及 `proxy.conf=direct` 重启后旧代理复活的问题；设置接口现在返回实际持久化后的权威配置（代理认证信息不回显）。
+- 国际版登录与后续请求统一复用代理链路，国内版登录与请求统一复用固定 DNS 直连链路；`dns.conf=system` 现在会真实使用系统 DNS。
+- 代理热更新改为原子替换客户端，避免并发请求期间修改 `http.Client.Transport`；补充 HTTPS 同源访问、网络响应读取和代理地址校验。
+- 统一积分复核默认值为 840 分钟（可调 60-1440），无变化最多复核 6 次。
+- 登录轮询增加会话占用、UID 去重和账号上限原子检查，避免并发请求重复添加或覆盖账号。
+- 积分查询支持多页套餐并校验分页完整性；静态前端资源禁用缓存，部署更新后立即加载新逻辑。
+- 增加监听地址与 `Host` 白名单校验，通配监听默认只接受 IP/localhost，反向代理域名通过 `WBH_ALLOWED_HOSTS` 显式配置；批量任务增加全局互斥，避免重复并发执行。
+- 国内/国际账号操作增加版本边界校验；启动时归一化旧设置；状态主文件损坏时校验并回退有效备份，未来版本状态不会被旧备份降级。
+- 可选请求体保持向后兼容；登录授权会话限制为最多 32 个并自动清理过期会话；协议错误回显统一截断。
+- 国际版直连在系统 DNS 返回不可达地址时会再次尝试固定 DNS；可移植导出会保留 `proxy.conf` / `dns.conf`；新增可选内置 Basic Auth 与 GitHub Actions / Docker 构建检查。
 
 ### v1.0.5（2026-09-17）
 
@@ -361,9 +391,9 @@ A：签到与积分使用 WorkBuddy 客户端当前调用的 billing 接口；�
 ### v1.0.2（2026-09-14）
 
 - **版本切换 = 账号列表切换**：页头下拉在国内版 / 国际版间切换，两套账号容器独立管理；每日定时任务按「每日任务版本」执行对应列表（国内版签到 / 国际版活跃）。
-- **国际版活跃获取积分**：以 WorkBuddy 桌面客户端完整特征（UA `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`、`X-IDE-Type/Name: WorkBuddy`、`X-Product: SaaS`）向 `workbuddy.ai/v2/chat/completions` 发送一次极小会话（hy3 / hy4-preview，max_tokens=16），当日即认定为活跃账号。
+- **国际版活跃获取积分**：以 WorkBuddy 桌面客户端完整特征（UA `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1`、`X-IDE-Type/Name: WorkBuddy`、`X-Product: SaaS`）向 `workbuddy.ai/v2/chat/completions` 发送一次会话（hy3 / hy4-preview，默认 `max_tokens=64`，较长提示词为 `160`），当日即认定为活跃账号。
 - **国际版登录授权**：「添加账户」按当前版本拉取对应授权页——国际版为 `https://www.workbuddy.ai/login?platform=workbuddy-ai&state=...`（state → 授权页 → token 轮询 → account 全链路对齐客户端）。
-- **积分延迟复核**：活跃后按设置延迟（默认 60 分钟，可调 5-720）自动复查积分到账，无变化最多重试 3 次，日志记录积分增量。
+- **积分延迟复核**：活跃后按当时默认 60 分钟（可调 5-720）自动复查积分到账，无变化最多重试 3 次，日志记录积分增量；后续版本已调整默认值与范围，当前值见上方 v1.0.6 说明。
 - **一键刷新积分**：位于「全部签到」左侧，立即刷新当前版本列表全部账号积分。
 - `/healthz` 返回版本号（`ok 1.0.2`），便于部署验证。
 

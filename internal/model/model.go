@@ -55,10 +55,22 @@ type Account struct {
 }
 
 func (a Account) Region() string {
-	if IsGlobalDomain(a.Domain) {
+	if a.VersionMode() == ModeIntl {
 		return "global"
 	}
 	return "cn"
+}
+
+// VersionMode returns the account's effective product version. Older state
+// files may not have persisted Version, so infer it from the login domain.
+func (a Account) VersionMode() string {
+	if a.Version == ModeCN || a.Version == ModeIntl {
+		return a.Version
+	}
+	if IsGlobalDomain(a.Domain) {
+		return ModeIntl
+	}
+	return ModeCN
 }
 
 func (a Account) DisplayName() string {
@@ -87,16 +99,29 @@ type Settings struct {
 	ScheduleTime     string `json:"scheduleTime"`
 	LastScheduledDay string `json:"lastScheduledDay,omitempty"`
 	// Mode: cn（默认，每日签到）或 intl（国际版活跃获取）
-	Mode        string `json:"mode,omitempty"`
-	ActiveModel string `json:"activeModel,omitempty"`
-	// 活跃后积分复核延迟（分钟），积分非即时到账，默认 60，可用于实测到账延迟
-	RecheckDelayMinutes int `json:"recheckDelayMinutes,omitempty"`
+	Mode        string `json:"mode"`
+	ActiveModel string `json:"activeModel"`
+	// 活跃后积分复核延迟（分钟），积分非即时到账，默认 840（约 14 小时），可按实测调整
+	RecheckDelayMinutes int `json:"recheckDelayMinutes"`
 	// ProxyURL 自定义代理：支持 http:// https:// socks5:// socks5h://（含认证 user:pass@host:port）
-	// 为空直连；作用于全部上游请求（国内版与国际版域名均适用）
-	ProxyURL string `json:"proxyUrl,omitempty"`
-	// ActivePrompt 国际版活跃会话的用户消息内容；为空使用默认 "hi"。
+	// 为空直连；作用于国际版上游请求，国内版始终固定 DNS 直连
+	ProxyURL string `json:"proxyUrl"`
+	// ActivePrompt 国际版活跃会话的用户消息内容；为空使用 client.DefaultActivePrompt。
 	// 太短的问候可能被服务端判定为非有效会话，可自定义更自然的多句提问。
-	ActivePrompt string `json:"activePrompt,omitempty"`
+	ActivePrompt string `json:"activePrompt"`
+}
+
+// SettingsPatch 是 PUT /api/settings 使用的请求模型。
+// 指针字段用于区分“未提交”与“明确提交零值/空字符串”，避免局部更新误清空设置，
+// 同时允许用户显式清除代理、提示词或关闭定时任务。
+type SettingsPatch struct {
+	ScheduleEnabled     *bool   `json:"scheduleEnabled"`
+	ScheduleTime        *string `json:"scheduleTime"`
+	Mode                *string `json:"mode"`
+	ActiveModel         *string `json:"activeModel"`
+	RecheckDelayMinutes *int    `json:"recheckDelayMinutes"`
+	ProxyURL            *string `json:"proxyUrl"`
+	ActivePrompt        *string `json:"activePrompt"`
 }
 
 // ValidProxyScheme 代理协议白名单
@@ -129,7 +154,7 @@ func NewState() State {
 			ScheduleTime:        "09:15",
 			Mode:                ModeCN,
 			ActiveModel:         "hy3",
-			RecheckDelayMinutes: 60,
+			RecheckDelayMinutes: 840,
 		},
 		Accounts: []Account{},
 		Logs:     []LogEntry{},
@@ -172,7 +197,7 @@ func (a Account) Public() PublicAccount {
 		Alias:            a.Alias,
 		DisplayName:      a.DisplayName(),
 		Region:           a.Region(),
-		Version:          a.Version,
+		Version:          a.VersionMode(),
 		Enabled:          a.Enabled,
 		Status:           a.Status,
 		LastError:        a.LastError,

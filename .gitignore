@@ -17,6 +17,12 @@ key.bin
 state.bin
 state.bin.bak
 state.bin.tmp
+proxy.conf
+proxy.conf.bak
+proxy.conf.tmp
+dns.conf
+dns.conf.bak
+dns.conf.tmp
 instance.lock
 
 # 编辑器 / 系统

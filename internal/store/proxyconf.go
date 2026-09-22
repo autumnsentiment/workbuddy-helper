@@ -15,19 +15,31 @@ const ProxyConfFileName = "proxy.conf"
 // 内容格式：第一行非空文本即代理 URL（如 socks5://192.168.5.1:1070）；
 // 空文件或 "direct" 表示直连。
 func LoadProxyConf(dir string) (string, error) {
-	raw, err := os.ReadFile(filepath.Join(dir, ProxyConfFileName))
+	value, _, err := LoadProxyConfWithPresence(dir)
+	return value, err
+}
+
+// LoadProxyConfWithPresence 与 LoadProxyConf 相同，但额外返回配置文件是否存在。
+// 这样可以区分“文件不存在，需要兼容 state.bin”与“明确写入 direct，应覆盖旧代理”。
+func LoadProxyConfWithPresence(dir string) (value string, found bool, err error) {
+	raw, err := readConfigFile(filepath.Join(dir, ProxyConfFileName))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return "", false, nil
 		}
-		return "", fmt.Errorf("read proxy config: %w", err)
+		return "", false, fmt.Errorf("read proxy config: %w", err)
 	}
-	line := strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0])
-	line = strings.TrimRight(line, "\r")
-	if line == "" || strings.EqualFold(line, "direct") {
-		return "", nil
+	for _, rawLine := range strings.Split(string(raw), "\n") {
+		line := strings.TrimSpace(strings.TrimRight(rawLine, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.EqualFold(line, "direct") {
+			return "", true, nil
+		}
+		return line, true, nil
 	}
-	return line, nil
+	return "", true, nil
 }
 
 // SaveProxyConf 将代理 URL 写入数据目录（原子写）；proxyURL 为空时写 "direct"。
@@ -36,23 +48,17 @@ func SaveProxyConf(dir, proxyURL string) error {
 	if proxyURL == "" {
 		proxyURL = "direct"
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create data directory: %w", err)
-	}
 	path := filepath.Join(dir, ProxyConfFileName)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(proxyURL+"\n"), 0o600); err != nil {
-		return fmt.Errorf("write proxy config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("replace proxy config: %w", err)
-	}
-	return nil
+	return writeConfigFile(path, []byte(proxyURL+"\n"))
 }
 
 // LoadProxyConf 是 Store 的便捷包装。
 func (s *Store) LoadProxyConf() (string, error) { return LoadProxyConf(s.dir) }
+
+// LoadProxyConfWithPresence 是 Store 的便捷包装。
+func (s *Store) LoadProxyConfWithPresence() (string, bool, error) {
+	return LoadProxyConfWithPresence(s.dir)
+}
 
 // SaveProxyConf 是 Store 的便捷包装。
 func (s *Store) SaveProxyConf(proxyURL string) error { return SaveProxyConf(s.dir, proxyURL) }

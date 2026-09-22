@@ -1,12 +1,14 @@
 package client
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"workbuddy-helper/internal/model"
 )
@@ -20,7 +22,13 @@ func response(status int, body string) *http.Response {
 }
 
 func testClient(rt roundTripFunc) *Client {
-	return &Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://chat.example", BillingBaseCN: "https://billing.example", GlobalBase: "https://global.example"}
+	return &Client{HTTP: &http.Client{
+		Transport: rt,
+		// Production clients never follow upstream redirects. Keep the test
+		// transport on the same contract so a 3xx response is classified by
+		// the client instead of being retried against an attacker-controlled URL.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}, ChatBaseCN: "https://chat.example", BillingBaseCN: "https://billing.example", GlobalBase: "https://global.example"}
 }
 
 func TestPointsAggregation(t *testing.T) {
@@ -39,9 +47,196 @@ func TestPointsAggregation(t *testing.T) {
 	}
 }
 
+func TestPointsFetchesAllPages(t *testing.T) {
+	var requestedPages []int
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		var request struct {
+			PageNumber int `json:"PageNumber"`
+			PageSize   int `json:"PageSize"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		requestedPages = append(requestedPages, request.PageNumber)
+		if request.PageSize != pointsPageSize {
+			t.Fatalf("PageSize=%d", request.PageSize)
+		}
+		count := pointsPageSize
+		if request.PageNumber == 2 {
+			count = 1
+		}
+		accounts := make([]map[string]any, count)
+		for i := range accounts {
+			accounts[i] = map[string]any{
+				"PackageName":         "积分包",
+				"CycleCapacitySize":   10,
+				"CycleCapacityRemain": 7,
+				"CycleCapacityUsed":   3,
+				"CycleEndTime":        "2026-12-31 23:59:59",
+			}
+		}
+		raw, err := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{"Response": map[string]any{"Data": map[string]any{
+				"TotalCount": 101,
+				"Accounts":   accounts,
+			}}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response(http.StatusOK, string(raw)), nil
+	})
+
+	got, err := c.Points(&model.Account{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requestedPages) != 2 || requestedPages[0] != 1 || requestedPages[1] != 2 {
+		t.Fatalf("requested pages=%v", requestedPages)
+	}
+	if got.Balance != 707 || got.Used != 303 || got.Total != 1010 || len(got.Packages) != 101 {
+		t.Fatalf("unexpected paged result: %+v packages=%d", got, len(got.Packages))
+	}
+	if got.Packages[100].ExpiresAt != "2026-12-31 23:59:59" {
+		t.Fatalf("CycleEndTime fallback was not used: %+v", got.Packages[100])
+	}
+}
+
+func TestPointsRejectsIncompletePagination(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		var request struct {
+			PageNumber int `json:"PageNumber"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		accounts := make([]map[string]any, 0)
+		if request.PageNumber == 1 {
+			accounts = make([]map[string]any, pointsPageSize)
+			for i := range accounts {
+				accounts[i] = map[string]any{"PackageName": "积分包", "CapacitySize": 1, "CapacityRemain": 1}
+			}
+		}
+		raw, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{"Response": map[string]any{"Data": map[string]any{
+				"TotalCount": 101,
+				"Accounts":   accounts,
+			}}},
+		})
+		return response(http.StatusOK, string(raw)), nil
+	})
+
+	_, err := c.Points(&model.Account{AccessToken: "at", UID: "u1"})
+	if !IsKind(err, KindProtocol) || !strings.Contains(err.Error(), "分页不完整") {
+		t.Fatalf("expected incomplete pagination protocol error, got %v", err)
+	}
+}
+
+func TestPointsRejectsMissingAccountsShape(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return response(http.StatusOK, `{"code":0,"data":{"Response":{"Data":{"TotalCount":0}}}}`), nil
+	})
+	_, err := c.Points(&model.Account{AccessToken: "at", UID: "u1"})
+	if !IsKind(err, KindProtocol) || !strings.Contains(err.Error(), "缺少套餐列表") {
+		t.Fatalf("expected missing accounts protocol error, got %v", err)
+	}
+}
+
+func TestPointsWithoutTotalCountProbesPastFullPage(t *testing.T) {
+	var requestedPages []int
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		var request struct {
+			PageNumber int `json:"PageNumber"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		requestedPages = append(requestedPages, request.PageNumber)
+		count := 100
+		if request.PageNumber == 2 {
+			count = 1
+		}
+		accounts := make([]map[string]any, count)
+		for i := range accounts {
+			accounts[i] = map[string]any{"PackageName": "积分包", "CapacitySize": 1, "CapacityRemain": 1}
+		}
+		raw, _ := json.Marshal(map[string]any{
+			"code": 0,
+			"data": map[string]any{"Response": map[string]any{"Data": map[string]any{
+				"Accounts": accounts,
+			}}},
+		})
+		return response(http.StatusOK, string(raw)), nil
+	})
+
+	got, err := c.Points(&model.Account{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requestedPages) != 2 || requestedPages[0] != 1 || requestedPages[1] != 2 {
+		t.Fatalf("requested pages=%v", requestedPages)
+	}
+	if len(got.Packages) != 101 {
+		t.Fatalf("expected all packages, got %d", len(got.Packages))
+	}
+}
+
+func TestCloneWithTransportSafeDefaultsWhenSourceHTTPMissing(t *testing.T) {
+	clone := CloneWithTransport(&Client{}, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return response(http.StatusOK, "{}"), nil
+	}))
+	if clone.HTTP == nil || clone.HTTP.Timeout != 30*time.Second || clone.HTTP.CheckRedirect == nil {
+		t.Fatalf("clone defaults not preserved: %#v", clone.HTTP)
+	}
+}
+
+func TestNewWithCNTransportPreservesCallerOwnedHTTPTransport(t *testing.T) {
+	// A caller may inject a *http.Transport for custom TLS, proxy, or tracing.
+	// It must not be mistaken for the package-owned default merely because it
+	// has the same concrete type.
+	custom := &http.Transport{MaxIdleConns: 7}
+	caller := &Client{HTTP: &http.Client{Transport: custom}}
+	if got := NewWithCNTransport(caller); got != nil {
+		t.Fatal("custom *http.Transport was unexpectedly replaced")
+	}
+
+	owned := New()
+	if owned.ownedTransport == nil {
+		t.Fatal("New did not record its owned transport")
+	}
+	if got := NewWithCNTransport(owned); got == nil {
+		t.Fatal("package-owned transport was not replaced")
+	}
+}
+
+func TestClientRoutingUsesEffectiveAccountVersion(t *testing.T) {
+	c := &Client{
+		ChatBaseCN:    "https://cn-chat.example",
+		BillingBaseCN: "https://cn-billing.example",
+		GlobalBase:    "https://intl-chat.example",
+		GlobalBilling: "https://intl-billing.example",
+	}
+	intl := &model.Account{Version: model.ModeIntl, Domain: "codebuddy.cn"}
+	if got := c.base(intl, false); got != c.GlobalBase {
+		t.Fatalf("explicit international account used chat endpoint %q", got)
+	}
+	if got := c.base(intl, true); got != c.GlobalBilling {
+		t.Fatalf("explicit international account used billing endpoint %q", got)
+	}
+	cn := &model.Account{Version: model.ModeCN, Domain: "workbuddy.ai"}
+	if got := c.base(cn, false); got != c.ChatBaseCN {
+		t.Fatalf("explicit domestic account used chat endpoint %q", got)
+	}
+}
+
 func TestClassifyAuth(t *testing.T) {
 	if !IsKind(classifyHTTP(401, `{"code":12153,"msg":"Offline user session not found"}`), KindAuthDead) {
 		t.Fatal("expected auth dead")
+	}
+	if !IsKind(classifyHTTP(400, `{"error":"User session not found"}`), KindAuthDead) {
+		t.Fatal("session-not-found HTTP errors should invalidate the account")
 	}
 	if !IsKind(classifyHTTP(429, "slow down"), KindRate) {
 		t.Fatal("expected rate")
@@ -148,25 +343,220 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	}
 }
 
+func TestActiveChatRejectsRedirectStatus(t *testing.T) {
+	c := testClient(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"https://evil.example/"}},
+			Body:       io.NopCloser(strings.NewReader("redirect")),
+		}, nil
+	})
+	c.HTTP.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	err := c.ActiveChat(&model.Account{AccessToken: "at", UID: "u1", Domain: "workbuddy.ai"}, "hy3", "test prompt")
+	if err == nil || !IsKind(err, KindBusiness) {
+		t.Fatalf("redirect response was accepted: %v", err)
+	}
+}
+
 func TestValidateProxyURL(t *testing.T) {
 	cases := []struct {
 		url  string
 		want bool
 	}{
 		{"", true},
+		{"direct", true},
+		{"DIRECT", true},
 		{"http://192.168.5.1:8080", true},
 		{"https://proxy.example.com:3128", true},
+		{"http://proxy.example.com:8080/", true},
 		{"socks5://192.168.5.1:1070", true},
 		{"socks5h://user:pass@gateway:1080", true},
 		{"ftp://bad.example:21", false},
 		{"not a url", false},
 		{"://missing-scheme", false},
+		{"http:///missing-host", false},
+		{"http://proxy.example:", false},
+		{"http://proxy.example:70000", false},
+		{"http://proxy.example/path", false},
+		{"http://[::1]:8080", true},
+		{"socks5://[::1]:1080", true},
 	}
 	for _, c := range cases {
 		err := ValidateProxyURL(c.url)
 		if (err == nil) != c.want {
 			t.Errorf("ValidateProxyURL(%q) err=%v wantOK=%v", c.url, err, c.want)
 		}
+	}
+}
+
+func TestNormalizeProxyURLTreatsDirectAsCanonicalEmpty(t *testing.T) {
+	for _, value := range []string{"direct", "DIRECT", " Direct ", ""} {
+		if got := NormalizeProxyURL(value); got != "" {
+			t.Fatalf("NormalizeProxyURL(%q) = %q, want empty", value, got)
+		}
+	}
+	if got := NormalizeProxyURL("http://proxy.example:8080"); got != "http://proxy.example:8080" {
+		t.Fatalf("proxy URL changed unexpectedly: %q", got)
+	}
+}
+
+func TestNormalizeDNSServer(t *testing.T) {
+	cases := map[string]string{
+		"1.1.1.1":        "1.1.1.1:53",
+		"dns.example":    "dns.example:53",
+		"[::1]":          "[::1]:53",
+		"2001:db8::1":    "[2001:db8::1]:53",
+		"2001:db8::1:53": "[2001:db8::1:53]:53",
+		"[::1]:5353":     "[::1]:5353",
+	}
+	for input, want := range cases {
+		if got := normalizeDNSServer(input); got != want {
+			t.Errorf("normalizeDNSServer(%q)=%q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestLoginSessionUsesConfiguredTransportAndEndpoint(t *testing.T) {
+	called := false
+	rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		if r.URL.Host != "login.test" || r.URL.Path != "/v2/plugin/auth/state" {
+			t.Fatalf("unexpected login URL: %s", r.URL.String())
+		}
+		return response(http.StatusOK, `{"code":0,"data":{"state":"s1","authUrl":"https://login.test/authorize"}}`), nil
+	})
+	base := testClient(rt)
+	base.GlobalBase = "https://login.test"
+	session := NewLoginSessionWithClient(model.ModeIntl, base)
+	if err := session.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if !called || session.State != "s1" {
+		t.Fatalf("configured transport was not used: called=%v state=%q", called, session.State)
+	}
+}
+
+func TestLoginSessionKeepsTimeoutWhenBaseTimeoutIsUnset(t *testing.T) {
+	base := &Client{HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return response(http.StatusOK, `{"code":0,"data":{"state":"s1","authUrl":"https://login.test/authorize"}}`), nil
+	})}, GlobalBase: "https://login.test"}
+	session := NewLoginSessionWithClient(model.ModeIntl, base)
+	if session.Client.Timeout != 30*time.Second {
+		t.Fatalf("unset base timeout changed login timeout to %s", session.Client.Timeout)
+	}
+}
+
+func TestNewWithCNTransportPreservesDefaultsForEmptyCaller(t *testing.T) {
+	got := NewWithCNTransport(&Client{})
+	if got == nil || got.ChatBaseCN == "" || got.BillingBaseCN == "" || got.GlobalBase == "" || got.GlobalBilling == "" {
+		t.Fatalf("empty caller cleared default endpoints: %+v", got)
+	}
+}
+
+func TestValidateAuthURLRejectsUntrustedSchemesAndHosts(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		intl bool
+		ok   bool
+	}{
+		{name: "global product host", raw: "https://login.workbuddy.ai/authorize?state=x", intl: true, ok: true},
+		{name: "domestic product host", raw: "https://login.codebuddy.cn/authorize", intl: false, ok: true},
+		{name: "javascript scheme", raw: "javascript:alert(1)", intl: true, ok: false},
+		{name: "foreign host", raw: "https://evil.example/authorize", intl: true, ok: false},
+		{name: "userinfo", raw: "https://user:pass@login.workbuddy.ai/authorize", intl: true, ok: false},
+		{name: "missing path", raw: "https://login.workbuddy.ai", intl: true, ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAuthURL(tt.raw, tt.intl, "")
+			if (err == nil) != tt.ok {
+				t.Fatalf("validateAuthURL(%q) err=%v wantOK=%v", tt.raw, err, tt.ok)
+			}
+		})
+	}
+	if err := validateAuthURL("https://login.test/authorize", true, "https://login.test"); err != nil {
+		t.Fatalf("configured endpoint should be accepted: %v", err)
+	}
+}
+
+func TestLoginSessionRejectsUntrustedAuthURL(t *testing.T) {
+	base := testClient(func(*http.Request) (*http.Response, error) {
+		return response(http.StatusOK, `{"code":0,"data":{"state":"s1","authUrl":"https://evil.example/authorize"}}`), nil
+	})
+	base.GlobalBase = "https://login.test"
+	session := NewLoginSessionWithClient(model.ModeIntl, base)
+	if err := session.Start(); err == nil || !IsKind(err, KindProtocol) {
+		t.Fatalf("untrusted authorization URL was accepted: %v", err)
+	}
+}
+
+func TestLoginSessionPollClassifiesPendingAndFatalStatuses(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantKind    Kind
+		wantCode    int
+		wantPending bool
+	}{
+		{name: "authorization pending code", status: http.StatusBadRequest, body: `{"code":1001,"msg":"authorization pending"}`, wantKind: KindBusiness, wantCode: 1001, wantPending: true},
+		{name: "authorization pending message", status: http.StatusConflict, body: `{"code":0,"msg":"waiting for authorization"}`, wantKind: KindBusiness, wantPending: true},
+		{name: "unauthorized", status: http.StatusUnauthorized, body: `{"code":12153,"msg":"offline user session not found"}`, wantKind: KindAuthDead},
+		{name: "forbidden", status: http.StatusForbidden, body: `{"code":1002,"msg":"login forbidden"}`, wantKind: KindBusiness},
+		{name: "not found", status: http.StatusNotFound, body: `{"error":"login state not found"}`, wantKind: KindNotFound},
+		{name: "rate limited", status: http.StatusTooManyRequests, body: `{"code":1003,"msg":"too many requests"}`, wantKind: KindRate},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			base := testClient(func(*http.Request) (*http.Response, error) {
+				return response(tt.status, tt.body), nil
+			})
+			session := NewLoginSessionWithClient(model.ModeCN, base)
+			session.State = "poll-state"
+			_, err := session.Poll()
+			if err == nil || !IsKind(err, tt.wantKind) {
+				t.Fatalf("Poll error=%v, want kind %s", err, tt.wantKind)
+			}
+			var ce *Error
+			if !errors.As(err, &ce) {
+				t.Fatalf("Poll error does not expose client.Error: %v", err)
+			}
+			if tt.wantCode != 0 && ce.Code != tt.wantCode {
+				t.Fatalf("Poll code=%d, want %d", ce.Code, tt.wantCode)
+			}
+			pending := strings.Contains(ce.Msg, "登录尚未完成")
+			if pending != tt.wantPending {
+				t.Fatalf("Poll pending=%v msg=%q, want %v", pending, ce.Msg, tt.wantPending)
+			}
+		})
+	}
+}
+
+func TestSetDNSSystemUsesSystemMode(t *testing.T) {
+	SetDNSSystem()
+	if got := ActiveDNS(); len(got) != 0 {
+		t.Fatalf("system DNS mode should have no fixed servers: %v", got)
+	}
+	SetDNSConfig(nil)
+}
+
+func TestClassifyBusinessDoesNotTreatChatSessionAsAuthFailure(t *testing.T) {
+	if IsKind(classifyBusiness(http.StatusBadRequest, 10009, "conversation session not found"), KindAuthDead) {
+		t.Fatal("chat conversation lookup failure must not invalidate account auth")
+	}
+	if !IsKind(classifyBusiness(http.StatusBadRequest, 10010, "请求频繁，请稍后重试"), KindRate) {
+		t.Fatal("business rate-limit message should be classified as rate limited")
+	}
+}
+
+func TestHTTPBusinessCodeIsPreservedOnErrorStatus(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return response(http.StatusBadRequest, `{"code":14018,"msg":"quota"}`), nil
+	})
+	err := c.DailyCheckin(&model.Account{AccessToken: "at", UID: "u1"})
+	if !IsKind(err, KindCredit) {
+		t.Fatalf("expected credit error, got %v", err)
 	}
 }
 
@@ -185,6 +575,9 @@ func TestNewWithProxySocks5Transport(t *testing.T) {
 	direct, err := NewWithProxy("")
 	if err != nil || direct == nil {
 		t.Fatalf("empty proxy should succeed: %v", err)
+	}
+	if directSentinel, err := NewWithProxy("direct"); err != nil || directSentinel == nil {
+		t.Fatalf("direct sentinel should select direct transport: %v", err)
 	}
 }
 

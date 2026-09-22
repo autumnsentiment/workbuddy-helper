@@ -11,7 +11,7 @@
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-ARG APP_VERSION=1.0.5
+ARG APP_VERSION=1.0.6
 COPY go.mod go.sum ./
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/
@@ -26,7 +26,7 @@ RUN apk add --no-cache ca-certificates tzdata \
 WORKDIR /app
 COPY --from=build /out/workbuddy-helper /app/workbuddy-helper
 ENV TZ=Asia/Shanghai \
-    WBH_HOST=127.0.0.1 \
+    WBH_HOST=0.0.0.0 \
     WBH_DATA=/data
 VOLUME ["/data"]
 EXPOSE 18080

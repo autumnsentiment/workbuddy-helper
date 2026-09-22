@@ -14,6 +14,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,12 @@ type Client struct {
 	BillingBaseCN string
 	GlobalBase    string
 	GlobalBilling string
+	// ownedTransport is set only for transports created by this package.
+	// Service.New must replace that transport for the domestic fixed-DNS
+	// client, but must preserve a caller-injected *http.Transport (for tests,
+	// custom TLS, proxies, or tracing). A type assertion alone cannot make
+	// that distinction.
+	ownedTransport *http.Transport
 }
 
 // NewWithProxy 按代理 URL 构造客户端；proxyURL 为空等价于 New()（直连）。
@@ -98,8 +105,20 @@ func New() *Client {
 	})
 }
 
+type fallbackProxyDialer struct{}
+
+func (fallbackProxyDialer) Dial(network, address string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return dnsFallbackResolver.DialContext(ctx, network, address)
+}
+
+func (fallbackProxyDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return dnsFallbackResolver.DialContext(ctx, network, address)
+}
+
 func proxyTransport(proxyURL string) (*http.Transport, error) {
-	proxyURL = strings.TrimSpace(proxyURL)
+	proxyURL = NormalizeProxyURL(proxyURL)
 	if proxyURL == "" {
 		return &http.Transport{
 			MaxIdleConns:        32,
@@ -108,13 +127,14 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 			DialContext:         dnsFallbackResolver.DialContext,
 		}, nil
 	}
+	if err := ValidateProxyURL(proxyURL); err != nil {
+		return nil, err
+	}
 	u, err := url.Parse(proxyURL)
 	if err != nil {
-		return nil, fmt.Errorf("代理地址格式不正确: %w", err)
+		return nil, fmt.Errorf("代理地址格式不正确")
 	}
-	if !model.ValidProxyScheme(u.Scheme) {
-		return nil, fmt.Errorf("代理协议仅支持 http/https/socks5/socks5h，收到 %q", u.Scheme)
-	}
+	u.Scheme = strings.ToLower(u.Scheme)
 	transport := &http.Transport{
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 8,
@@ -133,7 +153,11 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 			pass, _ := u.User.Password()
 			auth = &proxy.Auth{User: u.User.Username(), Password: pass}
 		}
-		dialer, derr := proxy.SOCKS5("tcp", u.Host, auth, proxy.Direct)
+		proxyAddr := u.Host
+		if u.Port() == "" {
+			proxyAddr = net.JoinHostPort(u.Hostname(), "1080")
+		}
+		dialer, derr := proxy.SOCKS5("tcp", proxyAddr, auth, fallbackProxyDialer{})
 		if derr != nil {
 			return nil, fmt.Errorf("socks5 代理初始化失败: %w", derr)
 		}
@@ -145,9 +169,6 @@ func proxyTransport(proxyURL string) (*http.Transport, error) {
 	return transport, nil
 }
 
-// publicDNS 公共 DNS 兜底列表（容器内 Docker DNS 127.0.0.11 上游失效时使用）
-var publicDNS = []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"}
-
 // fixedResolver 固定 DNS 解析器：跳过系统 resolv.conf，直接向指定 DNS 发查询。
 // 用于国内版链路（DNS 可写 data/dns.conf 固定公共 DNS，容器 DNS 故障不影响）。
 func fixedResolver(servers []string) *net.Resolver {
@@ -157,15 +178,45 @@ func fixedResolver(servers []string) *net.Resolver {
 			d := net.Dialer{Timeout: 4 * time.Second}
 			var lastErr error
 			for _, ns := range servers {
+				ns = normalizeDNSServer(ns)
+				if ns == "" {
+					continue
+				}
 				c, err := d.DialContext(ctx, network, ns)
 				if err == nil {
 					return c, nil
 				}
 				lastErr = err
 			}
+			if lastErr == nil {
+				lastErr = fmt.Errorf("未配置可用 DNS 服务器")
+			}
 			return nil, lastErr
 		},
 	}
+}
+
+// normalizeDNSServer makes the common shorthand forms usable by net.Dial.
+// In particular, a bare IPv6 literal cannot carry a port without brackets;
+// treat it as a DNS server on the conventional port 53.
+func normalizeDNSServer(server string) string {
+	server = strings.TrimSpace(server)
+	if server == "" {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server
+	}
+	if strings.HasPrefix(server, "[") && strings.HasSuffix(server, "]") {
+		return net.JoinHostPort(server[1:len(server)-1], "53")
+	}
+	if net.ParseIP(server) != nil || strings.Count(server, ":") > 1 {
+		return net.JoinHostPort(server, "53")
+	}
+	if !strings.Contains(server, ":") {
+		return net.JoinHostPort(server, "53")
+	}
+	return server
 }
 
 // defaultDNS 默认固定公共 DNS（可被 data/dns.conf 覆盖）
@@ -173,14 +224,14 @@ var defaultDNS = []string{"223.5.5.5:53", "119.29.29.29:53", "1.1.1.1:53"}
 
 // SetDNSConfig 运行时更新固定 DNS（来自 data/dns.conf）。
 // 影响之后新建的 transport；已存在的 transport 由调用方重建。
-var dnsMu sync.Mutex
-var activeDNS = defaultDNS
+var dnsMu sync.RWMutex
+var activeDNS = append([]string(nil), defaultDNS...)
 
 func SetDNSConfig(servers []string) {
 	dnsMu.Lock()
 	defer dnsMu.Unlock()
 	if len(servers) > 0 {
-		activeDNS = servers
+		activeDNS = append([]string(nil), servers...)
 	} else {
 		activeDNS = append([]string(nil), defaultDNS...)
 	}
@@ -188,9 +239,32 @@ func SetDNSConfig(servers []string) {
 
 // ActiveDNS 返回当前固定 DNS 列表
 func ActiveDNS() []string {
-	dnsMu.Lock()
-	defer dnsMu.Unlock()
+	dnsMu.RLock()
+	defer dnsMu.RUnlock()
 	return append([]string(nil), activeDNS...)
+}
+
+func lookupWithDNSServers(ctx context.Context, host string, servers []string) ([]net.IP, error) {
+	var lastErr error
+	for _, server := range servers {
+		attemptCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		ips, err := fixedResolver([]string{server}).LookupIPAddr(attemptCtx, host)
+		cancel()
+		if err == nil && len(ips) > 0 {
+			result := make([]net.IP, 0, len(ips))
+			for _, ip := range ips {
+				result = append(result, ip.IP)
+			}
+			return result, nil
+		}
+		if err != nil {
+			lastErr = err
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("未配置可用 DNS 服务器")
+	}
+	return nil, lastErr
 }
 
 // dnsFallbackResolver 兜底解析器：优先系统路径，解析失败时用固定公共 DNS 重查。
@@ -202,25 +276,29 @@ type fallbackResolver struct{}
 
 func (r *fallbackResolver) resolve(ctx context.Context, host string) ([]net.IP, error) {
 	// 第一级：系统解析（容器内为 Docker DNS）
-	if ips, err := net.DefaultResolver.LookupIPAddr(ctx, host); err == nil && len(ips) > 0 {
+	systemCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	ips, systemErr := net.DefaultResolver.LookupIPAddr(systemCtx, host)
+	cancel()
+	if systemErr == nil && len(ips) > 0 {
 		addrs := make([]net.IP, 0, len(ips))
 		for _, ip := range ips {
 			addrs = append(addrs, ip.IP)
 		}
 		return addrs, nil
 	}
-	// 第二级：固定公共 DNS
-	dnsMu.Lock()
-	servers := append([]string(nil), activeDNS...)
-	dnsMu.Unlock()
-	res := fixedResolver(servers)
-	ips, err := res.LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, err
+	if systemErr == nil {
+		systemErr = fmt.Errorf("系统 DNS 未返回地址")
 	}
-	addrs := make([]net.IP, 0, len(ips))
-	for _, ip := range ips {
-		addrs = append(addrs, ip.IP)
+	// 第二级：固定公共 DNS
+	dnsMu.RLock()
+	servers := append([]string(nil), activeDNS...)
+	dnsMu.RUnlock()
+	if len(servers) == 0 {
+		return nil, systemErr
+	}
+	addrs, err := lookupWithDNSServers(ctx, host, servers)
+	if err != nil {
+		return nil, fmt.Errorf("系统 DNS 失败 (%v)，固定 DNS 也失败: %w", systemErr, err)
 	}
 	return addrs, nil
 }
@@ -239,8 +317,7 @@ func (r *fallbackResolver) DialContext(ctx context.Context, network, address str
 	d := net.Dialer{Timeout: 15 * time.Second}
 	ips, err := r.resolve(ctx, host)
 	if err != nil || len(ips) == 0 {
-		// 解析彻底失败：交回系统路径，返回原始错误
-		return d.DialContext(ctx, network, address)
+		return nil, err
 	}
 	var lastErr error
 	for _, ip := range ips {
@@ -250,6 +327,27 @@ func (r *fallbackResolver) DialContext(ctx context.Context, network, address str
 		}
 		lastErr = dialErr
 	}
+	// A system resolver can return an unreachable IPv6 address while omitting
+	// a usable A record. Retry with the configured fixed DNS servers after all
+	// system-resolved addresses fail; this is the common container symptom
+	// behind an otherwise misleading "无法连接 WorkBuddy" error.
+	dnsMu.RLock()
+	servers := append([]string(nil), activeDNS...)
+	dnsMu.RUnlock()
+	if len(servers) > 0 {
+		fallbackIPs, dnsErr := lookupWithDNSServers(ctx, host, servers)
+		if dnsErr == nil {
+			for _, ip := range fallbackIPs {
+				conn, dialErr := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+				if dialErr == nil {
+					return conn, nil
+				}
+				lastErr = dialErr
+			}
+		} else if lastErr == nil {
+			lastErr = dnsErr
+		}
+	}
 	return nil, lastErr
 }
 
@@ -258,22 +356,69 @@ func NewTransportOnly(proxyURL string) (*http.Transport, error) {
 	return proxyTransport(proxyURL)
 }
 
+// CloneWithTransport 返回一个复用端点配置、但拥有独立 http.Client/Transport 的客户端。
+// 调用方可以原子替换客户端指针，而不会在请求进行期间修改 http.Client.Transport。
+func CloneWithTransport(src *Client, transport http.RoundTripper) *Client {
+	if src == nil {
+		src = New()
+	}
+	clone := *src
+	// CloneWithTransport accepts caller-provided RoundTrippers, so the
+	// replacement must not be considered package-owned.
+	clone.ownedTransport = nil
+	if src.HTTP == nil {
+		clone.HTTP = &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: transport,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		return &clone
+	}
+	httpClone := *src.HTTP
+	httpClone.Transport = transport
+	clone.HTTP = &httpClone
+	return &clone
+}
+
+// CloseIdleConnections 释放客户端当前传输层的空闲连接。
+func (c *Client) CloseIdleConnections() {
+	if c == nil || c.HTTP == nil {
+		return
+	}
+	c.HTTP.CloseIdleConnections()
+}
+
 // NewWithCNTransport 国内版专用客户端：固定 DNS 直连（无代理）。
 // callerTransport 定制过（测试注入 upstream）时返回 nil，调用方保留原客户端。
 func NewWithCNTransport(caller *Client) *Client {
 	if caller != nil && caller.HTTP != nil && caller.HTTP.Transport != nil {
-		if _, isDefault := caller.HTTP.Transport.(*http.Transport); !isDefault {
-			return nil // 外部定制了 transport（RoundTripper 接口），保留
+		transport, isHTTPTransport := caller.HTTP.Transport.(*http.Transport)
+		if !isHTTPTransport || caller.ownedTransport == nil || transport != caller.ownedTransport {
+			return nil // 外部定制了 transport，保留其 TLS/代理/拨号配置
 		}
 	}
 	c := New()
 	c.HTTP.Transport = NewCNTransport()
+	// The returned client now owns the fixed-DNS transport. Keep the marker in
+	// sync so a later service setup can distinguish it from a caller-injected
+	// transport rather than observing the discarded generic transport.
+	c.ownedTransport, _ = c.HTTP.Transport.(*http.Transport)
 	// 保留调用方的端点定制（测试注入的 ChatBaseCN 等）
 	if caller != nil {
-		c.ChatBaseCN = caller.ChatBaseCN
-		c.BillingBaseCN = caller.BillingBaseCN
-		c.GlobalBase = caller.GlobalBase
-		c.GlobalBilling = caller.GlobalBilling
+		if strings.TrimSpace(caller.ChatBaseCN) != "" {
+			c.ChatBaseCN = caller.ChatBaseCN
+		}
+		if strings.TrimSpace(caller.BillingBaseCN) != "" {
+			c.BillingBaseCN = caller.BillingBaseCN
+		}
+		if strings.TrimSpace(caller.GlobalBase) != "" {
+			c.GlobalBase = caller.GlobalBase
+		}
+		if strings.TrimSpace(caller.GlobalBilling) != "" {
+			c.GlobalBilling = caller.GlobalBilling
+		}
 	}
 	return c
 }
@@ -282,29 +427,90 @@ func NewWithCNTransport(caller *Client) *Client {
 // DNS 服务器来自 data/dns.conf（默认公共 DNS），域名解析全部走固定服务器，
 // 容器内 Docker DNS（127.0.0.11）瘫痪也不影响国内版链路。
 func NewCNTransport() *http.Transport {
-	res := fixedResolver(ActiveDNS())
-	dialer := &net.Dialer{Timeout: 15 * time.Second, Resolver: res}
 	return &http.Transport{
 		MaxIdleConns:        32,
 		MaxIdleConnsPerHost: 8,
 		IdleConnTimeout:     90 * time.Second,
-		DialContext:         dialer.DialContext,
+		DialContext:         fixedDNSDialer{}.DialContext,
 		Proxy:               nil, // 国内版永远直连
 	}
 }
 
-// ValidateProxyURL 校验代理地址：空串合法（直连）；协议必须在 http/https/socks5/socks5h 白名单。
-func ValidateProxyURL(proxyURL string) error {
+type fixedDNSDialer struct{}
+
+func (fixedDNSDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	if net.ParseIP(host) != nil {
+		return dialer.DialContext(ctx, network, address)
+	}
+	servers := ActiveDNS()
+	if len(servers) == 0 {
+		return dialer.DialContext(ctx, network, address)
+	}
+	ips, err := lookupWithDNSServers(ctx, host, servers)
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, ip := range ips {
+		conn, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if dialErr == nil {
+			return conn, nil
+		}
+		lastErr = dialErr
+	}
+	return nil, lastErr
+}
+
+// SetDNSSystem restores the system resolver for the fixed-DNS transport.
+// It is used when data/dns.conf explicitly contains "system".
+func SetDNSSystem() {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+	activeDNS = []string{}
+}
+
+// NormalizeProxyURL converts the persistent/UI sentinel "direct" to the
+// canonical empty string used by the client and state model. The comparison
+// is case-insensitive so hand-edited proxy.conf files remain usable.
+func NormalizeProxyURL(proxyURL string) string {
 	proxyURL = strings.TrimSpace(proxyURL)
+	if strings.EqualFold(proxyURL, "direct") {
+		return ""
+	}
+	return proxyURL
+}
+
+// ValidateProxyURL 校验代理地址：空串或 direct 合法（直连）；协议必须在
+// http/https/socks5/socks5h 白名单。
+func ValidateProxyURL(proxyURL string) error {
+	proxyURL = NormalizeProxyURL(proxyURL)
 	if proxyURL == "" {
 		return nil
 	}
 	u, err := url.Parse(proxyURL)
-	if err != nil || u.Host == "" {
-		return fmt.Errorf("代理地址格式不正确: %s", proxyURL)
+	if err != nil || u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("代理地址格式不正确")
 	}
-	if !model.ValidProxyScheme(u.Scheme) {
-		return fmt.Errorf("代理协议仅支持 http/https/socks5/socks5h，收到 %q", u.Scheme)
+	if strings.HasSuffix(u.Host, ":") {
+		return fmt.Errorf("代理端口不能为空")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if !model.ValidProxyScheme(scheme) {
+		return fmt.Errorf("代理协议仅支持 http/https/socks5/socks5h，收到 %q", scheme)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("代理地址只能包含协议、认证信息、主机和端口")
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("代理端口必须在 1-65535 之间")
+		}
 	}
 	return nil
 }
@@ -318,15 +524,16 @@ func clientFromTransport(transport *http.Transport) *Client {
 				return http.ErrUseLastResponse
 			},
 		},
-		ChatBaseCN:    CNChatBase,
-		BillingBaseCN: CNBillingBase,
-		GlobalBase:    GlobalBase,
-		GlobalBilling: GlobalBillingBase,
+		ChatBaseCN:     CNChatBase,
+		BillingBaseCN:  CNBillingBase,
+		GlobalBase:     GlobalBase,
+		GlobalBilling:  GlobalBillingBase,
+		ownedTransport: transport,
 	}
 }
 
 func (c *Client) base(a *model.Account, billing bool) string {
-	if a != nil && isGlobal(a.Domain) {
+	if isGlobalAccount(a) {
 		if billing {
 			return c.GlobalBilling
 		}
@@ -338,8 +545,8 @@ func (c *Client) base(a *model.Account, billing bool) string {
 	return c.ChatBaseCN
 }
 
-func isGlobal(domain string) bool {
-	return model.IsGlobalDomain(domain)
+func isGlobalAccount(a *model.Account) bool {
+	return a != nil && a.VersionMode() == model.ModeIntl
 }
 
 func commonHeaders(req *http.Request, origin string) {
@@ -353,7 +560,7 @@ func commonHeaders(req *http.Request, origin string) {
 
 func authHeaders(req *http.Request, a *model.Account, billing bool) {
 	origin := "https://www.codebuddy.cn"
-	if isGlobal(a.Domain) {
+	if isGlobalAccount(a) {
 		origin = "https://www.workbuddy.ai"
 	}
 	if billing {
@@ -382,14 +589,48 @@ type envelope struct {
 	Data json.RawMessage `json:"data"`
 }
 
+var errResponseTooLarge = errors.New("response body too large")
+
+func readResponseBody(body io.Reader, limit int64) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > limit {
+		return nil, errResponseTooLarge
+	}
+	return raw, nil
+}
+
+// drainResponseBody consumes a streaming response without retaining it in
+// memory. A cap is still important: an upstream that never closes an SSE
+// stream must not keep an account operation busy forever (the HTTP client
+// timeout is only a coarse upper bound).
+func drainResponseBody(body io.Reader, limit int64) error {
+	n, err := io.Copy(io.Discard, io.LimitReader(body, limit+1))
+	if err != nil {
+		return err
+	}
+	if n > limit {
+		return errResponseTooLarge
+	}
+	return nil
+}
+
 func (c *Client) doEnvelope(req *http.Request) (json.RawMessage, int, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, 0, &Error{Kind: KindTransport, Msg: err.Error()}
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if resp.StatusCode >= 400 {
+	raw, readErr := readResponseBody(resp.Body, 2<<20)
+	if readErr != nil {
+		if errors.Is(readErr, errResponseTooLarge) {
+			return nil, resp.StatusCode, &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "响应内容过大"}
+		}
+		return nil, resp.StatusCode, &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取响应失败: " + readErr.Error()}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		var env envelope
 		if json.Unmarshal(raw, &env) == nil && (env.Code != 0 || env.Msg != "") {
 			return nil, resp.StatusCode, classifyBusiness(resp.StatusCode, env.Code, env.Msg)
@@ -422,8 +663,9 @@ func isCreditExhausted(code int, msg string) bool {
 
 func classifyHTTP(status int, body string) error {
 	msg := short(body, 180)
+	lower := strings.ToLower(body)
 	switch {
-	case status == http.StatusUnauthorized || strings.Contains(body, "12153") || strings.Contains(strings.ToLower(body), "offline user session"):
+	case status == http.StatusUnauthorized || strings.Contains(body, "12153") || strings.Contains(lower, "offline user session") || strings.Contains(lower, "user session not found"):
 		return &Error{Kind: KindAuthDead, Status: status, Msg: msg}
 	case isCreditExhausted(0, body):
 		return &Error{Kind: KindCredit, Status: status, Msg: msg}
@@ -440,13 +682,13 @@ func classifyHTTP(status int, body string) error {
 
 func classifyBusiness(status, code int, msg string) error {
 	lower := strings.ToLower(msg)
-	if status == http.StatusUnauthorized || code == 12153 || strings.Contains(lower, "offline user session") || strings.Contains(lower, "session not found") {
+	if status == http.StatusUnauthorized || code == 12153 || strings.Contains(lower, "offline user session") || strings.Contains(lower, "user session not found") {
 		return &Error{Kind: KindAuthDead, Status: status, Code: code, Msg: msg}
 	}
 	switch {
 	case isCreditExhausted(code, msg):
 		return &Error{Kind: KindCredit, Status: status, Code: code, Msg: msg}
-	case status == http.StatusTooManyRequests:
+	case status == http.StatusTooManyRequests || strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many request") || strings.Contains(msg, "请求频繁") || strings.Contains(msg, "请求过于频繁") || strings.Contains(msg, "限流"):
 		return &Error{Kind: KindRate, Status: status, Code: code, Msg: msg}
 	case status == http.StatusNotFound:
 		return &Error{Kind: KindNotFound, Status: status, Code: code, Msg: msg}
@@ -458,8 +700,9 @@ func classifyBusiness(status, code int, msg string) error {
 
 func short(s string, n int) string {
 	s = strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
-	if len(s) > n {
-		return s[:n] + "..."
+	runes := []rune(s)
+	if len(runes) > n {
+		return string(runes[:n]) + "..."
 	}
 	return s
 }
@@ -468,26 +711,48 @@ type LoginSession struct {
 	State   string
 	AuthURL string
 	Client  *http.Client
+	baseURL string
 	// intl=true 时走国际版授权（workbuddy.ai，platform=workbuddy-ai）
 	intl bool
 }
 
 // NewLoginSession version: ModeCN（国内版 CLI 授权）/ ModeIntl（国际版授权）
 func NewLoginSession(version string) *LoginSession {
+	return NewLoginSessionWithClient(version, nil)
+}
+
+// NewLoginSessionWithClient 创建拥有独立 Cookie Jar 的登录会话，同时复用给定
+// API 客户端的传输层：国内版沿用固定 DNS 直连，国际版沿用当前代理配置。
+func NewLoginSessionWithClient(version string, base *Client) *LoginSession {
 	jar, _ := cookiejar.New(nil)
-	return &LoginSession{
-		Client: &http.Client{
-			Timeout: 30 * time.Second,
-			Jar:     jar,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		intl: version == model.ModeIntl,
+	intl := version == model.ModeIntl
+	baseURL := CNChatBase
+	loginClient := &http.Client{Timeout: 30 * time.Second}
+	if intl {
+		baseURL = GlobalBase
 	}
+	if base != nil {
+		if base.HTTP != nil {
+			if base.HTTP.Timeout > 0 {
+				loginClient.Timeout = base.HTTP.Timeout
+			}
+			loginClient.Transport = base.HTTP.Transport
+		}
+		if intl && base.GlobalBase != "" {
+			baseURL = base.GlobalBase
+		} else if !intl && base.ChatBaseCN != "" {
+			baseURL = base.ChatBaseCN
+		}
+	}
+	loginClient.Jar = jar
+	loginClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &LoginSession{Client: loginClient, baseURL: strings.TrimRight(baseURL, "/"), intl: intl}
 }
 
 func (s *LoginSession) chatBase() string {
+	if s.baseURL != "" {
+		return s.baseURL
+	}
 	if s.intl {
 		return GlobalBase
 	}
@@ -528,7 +793,64 @@ func (s *LoginSession) Start() error {
 	if err := json.Unmarshal(data, &result); err != nil || result.State == "" || result.AuthURL == "" {
 		return &Error{Kind: KindProtocol, Msg: "登录服务未返回授权地址"}
 	}
+	if err := validateAuthURL(result.AuthURL, s.intl, s.chatBase()); err != nil {
+		return &Error{Kind: KindProtocol, Msg: "登录服务返回了不受信任的授权地址"}
+	}
 	s.State, s.AuthURL = result.State, result.AuthURL
+	return nil
+}
+
+// validateAuthURL prevents an upstream response or compromised proxy from
+// turning the local login button into an arbitrary javascript/data/file link.
+// The real services use HTTPS on the corresponding WorkBuddy/CodeBuddy host;
+// tests and self-hosted gateways may use HTTP only when they keep the same
+// product host name.
+func validateAuthURL(raw string, intl bool, expectedBase string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.User != nil || u.Host == "" || u.Path == "" {
+		return fmt.Errorf("invalid authorization URL")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return fmt.Errorf("unsupported authorization URL scheme")
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if host == "" {
+		return fmt.Errorf("missing authorization URL host")
+	}
+	expectedHost := ""
+	expectedScheme := ""
+	expectedPort := ""
+	if base, baseErr := url.Parse(strings.TrimSpace(expectedBase)); baseErr == nil {
+		expectedHost = strings.ToLower(strings.TrimSuffix(base.Hostname(), "."))
+		expectedScheme = strings.ToLower(base.Scheme)
+		expectedPort = base.Port()
+	}
+	if expectedHost != "" && host == expectedHost {
+		if expectedScheme != "" && scheme != expectedScheme {
+			return fmt.Errorf("authorization URL scheme does not match login endpoint")
+		}
+		if expectedPort != "" && u.Port() != expectedPort {
+			return fmt.Errorf("authorization URL port does not match login endpoint")
+		}
+		return nil
+	}
+	// Production product hosts must never downgrade to HTTP. HTTP remains
+	// available only for an explicitly configured HTTP test/self-hosted base
+	// above.
+	if scheme != "https" {
+		return fmt.Errorf("authorization URL must use HTTPS")
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		return fmt.Errorf("authorization URL uses an unexpected port")
+	}
+	if intl {
+		if host != "workbuddy.ai" && !strings.HasSuffix(host, ".workbuddy.ai") {
+			return fmt.Errorf("authorization URL host is not WorkBuddy")
+		}
+	} else if host != "codebuddy.cn" && !strings.HasSuffix(host, ".codebuddy.cn") && host != "copilot.tencent.com" && !strings.HasSuffix(host, ".copilot.tencent.com") {
+		return fmt.Errorf("authorization URL host is not CodeBuddy")
+	}
 	return nil
 }
 
@@ -553,10 +875,16 @@ func (s *LoginSession) Poll() (LoginResult, error) {
 		return LoginResult{}, err
 	}
 	commonHeaders(req, s.origin())
-	data, status, err := base.doEnvelope(req)
+	data, _, err := base.doEnvelope(req)
 	if err != nil {
-		if status >= 400 && status < 500 {
-			return LoginResult{}, &Error{Kind: KindBusiness, Status: status, Msg: "登录尚未完成，请先在浏览器完成授权"}
+		// The token endpoint uses a small business-error response while the
+		// browser has not finished authorization. Do not treat every 4xx as
+		// pending: 401/403/404/429 are actionable failures and must reach the UI.
+		if isAuthorizationPendingError(err) {
+			var pending *Error
+			if errors.As(err, &pending) {
+				return LoginResult{}, &Error{Kind: KindBusiness, Status: pending.Status, Code: pending.Code, Msg: "登录尚未完成，请先在浏览器完成授权"}
+			}
 		}
 		return LoginResult{}, err
 	}
@@ -600,6 +928,36 @@ func (s *LoginSession) Poll() (LoginResult, error) {
 	return result, nil
 }
 
+// isAuthorizationPendingError recognizes only the token endpoint's explicit
+// pending responses. A generic 4xx must never keep the browser polling loop
+// alive indefinitely because it may indicate an expired or invalid session.
+func isAuthorizationPendingError(err error) bool {
+	var ce *Error
+	if !errors.As(err, &ce) || ce.Kind != KindBusiness {
+		return false
+	}
+	if ce.Status != http.StatusBadRequest && ce.Status != http.StatusConflict {
+		return false
+	}
+	// 1001 is the token endpoint's authorization-in-progress response used by
+	// both domestic and international login services. Keep message matching
+	// as a compatibility fallback for deployments that omit the numeric code.
+	if ce.Code == 1001 {
+		return true
+	}
+	lower := strings.ToLower(strings.TrimSpace(ce.Msg))
+	for _, marker := range []string{
+		"authorization pending", "login pending", "waiting for authorization",
+		"waiting for login", "not yet authorized", "尚未完成", "等待授权",
+		"等待登录", "授权中", "登录中", "请先在浏览器",
+	} {
+		if strings.Contains(lower, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Client) Refresh(a *model.Account) error {
 	if strings.TrimSpace(a.RefreshToken) == "" {
 		return &Error{Kind: KindAuthDead, Msg: "缺少 refresh token，请重新添加账号"}
@@ -610,7 +968,7 @@ func (c *Client) Refresh(a *model.Account) error {
 	}
 	// 国际版客户端刷新头对齐：X-Auth-Refresh-Source 为 plugin（逆向自国际版客户端 refreshSession）
 	source := "workbuddy"
-	if isGlobal(a.Domain) {
+	if isGlobalAccount(a) {
 		source = "plugin"
 	}
 	commonHeaders(req, originFor(a))
@@ -648,7 +1006,7 @@ func (c *Client) Refresh(a *model.Account) error {
 }
 
 func originFor(a *model.Account) string {
-	if a != nil && isGlobal(a.Domain) {
+	if isGlobalAccount(a) {
 		return "https://www.workbuddy.ai"
 	}
 	return "https://www.codebuddy.cn"
@@ -755,7 +1113,7 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 	req.Header.Set("X-Conversation-ID", convID)
 	req.Header.Set("X-Conversation-Request-ID", reqID)
 	req.Header.Set("Accept", "text/event-stream")
-	if isGlobal(a.Domain) {
+	if isGlobalAccount(a) {
 		// 活跃记录按客户端识别：必须带 WorkBuddy 桌面端特征（X-IDE-* + 客户端 UA），
 		// 缺失会在 plans-usage 里显示为未知客户端
 		req.Header.Set("User-Agent", IntlClientUA)
@@ -768,12 +1126,28 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 		return &Error{Kind: KindTransport, Msg: err.Error()}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readResponseBody(resp.Body, 2<<20)
+		if readErr != nil {
+			if errors.Is(readErr, errResponseTooLarge) {
+				return &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "响应内容过大"}
+			}
+			return &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取响应失败: " + readErr.Error()}
+		}
+		var env envelope
+		if json.Unmarshal(raw, &env) == nil && (env.Code != 0 || env.Msg != "") {
+			return classifyBusiness(resp.StatusCode, env.Code, env.Msg)
+		}
 		return classifyHTTP(resp.StatusCode, string(raw))
 	}
-	// 2xx：读完整个 SSE 流（max_tokens 很小，秒级结束），确保服务端完整受理本次会话
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// 2xx：读完整个 SSE 流（max_tokens 很小，秒级结束），确保服务端完整受理本次会话。
+	// 同时限制最大响应体，避免异常上游令活跃操作无界读取。
+	if err := drainResponseBody(resp.Body, 2<<20); err != nil {
+		if errors.Is(err, errResponseTooLarge) {
+			return &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "对话响应内容过大"}
+		}
+		return &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取对话响应失败: " + err.Error()}
+	}
 
 	// 备用通道：桌面端主路径是请求体 extra_vars.growthEvent（上方已带），
 	// 这里再补一次独立遥测上报（部分服务端路径从 /v2/report 读取），失败不阻断。
@@ -862,7 +1236,12 @@ func (c *Client) reportChatEvent(a *model.Account, prompt, modelName, convID, re
 		return &Error{Kind: KindTransport, Msg: err.Error()}
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	if err := drainResponseBody(resp.Body, 2<<20); err != nil {
+		if errors.Is(err, errResponseTooLarge) {
+			return &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "遥测响应内容过大"}
+		}
+		return &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取遥测响应失败: " + err.Error()}
+	}
 	return nil
 }
 
@@ -899,11 +1278,27 @@ type PointResult struct {
 	Packages []model.PointPackage
 }
 
-func (c *Client) Points(a *model.Account) (PointResult, error) {
-	now := time.Now()
+const (
+	pointsPageSize = 100
+	pointsMaxPages = 100
+)
+
+type pointsPackage struct {
+	PackageName         string `json:"PackageName"`
+	CapacityRemain      int64  `json:"CapacityRemain"`
+	CapacityUsed        int64  `json:"CapacityUsed"`
+	CapacitySize        int64  `json:"CapacitySize"`
+	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+	PackageEndTime      string `json:"PackageEndTime"`
+	CycleEndTime        string `json:"CycleEndTime"`
+}
+
+func (c *Client) pointsPage(a *model.Account, now time.Time, pageNumber int) ([]pointsPackage, *int, error) {
 	body, _ := json.Marshal(map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
+		"PageNumber":               pageNumber,
+		"PageSize":                 pointsPageSize,
 		"ProductCode":              "p_tcaca",
 		"Status":                   []int{0, 3},
 		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
@@ -911,41 +1306,92 @@ func (c *Client) Points(a *model.Account) (PointResult, error) {
 	})
 	req, err := http.NewRequest(http.MethodPost, c.base(a, true)+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
 	if err != nil {
-		return PointResult{}, err
+		return nil, nil, err
 	}
 	authHeaders(req, a, true)
 	data, _, err := c.doEnvelope(req)
 	if err != nil {
-		return PointResult{}, err
+		return nil, nil, err
 	}
 	var envelopeData struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					PackageEndTime      string `json:"PackageEndTime"`
-				} `json:"Accounts"`
+		Response *struct {
+			Data *struct {
+				TotalCount *int             `json:"TotalCount"`
+				Accounts   *[]pointsPackage `json:"Accounts"`
 			} `json:"Data"`
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &envelopeData); err != nil {
-		return PointResult{}, &Error{Kind: KindProtocol, Msg: "积分响应格式发生变化"}
+		return nil, nil, &Error{Kind: KindProtocol, Msg: "积分响应格式发生变化"}
 	}
-	result := PointResult{}
-	for _, p := range envelopeData.Response.Data.Accounts {
+	if envelopeData.Response == nil || envelopeData.Response.Data == nil || envelopeData.Response.Data.Accounts == nil {
+		return nil, nil, &Error{Kind: KindProtocol, Msg: "积分响应缺少套餐列表"}
+	}
+	return *envelopeData.Response.Data.Accounts, envelopeData.Response.Data.TotalCount, nil
+}
+
+func appendPointsPackages(result *PointResult, packages []pointsPackage) {
+	for _, p := range packages {
 		remain, used, total := packageValues(p.CycleCapacityRemain, p.CycleCapacityUsed, p.CycleCapacitySize, p.CapacityRemain, p.CapacityUsed, p.CapacitySize)
 		result.Balance += remain
 		result.Used += used
 		result.Total += total
-		result.Packages = append(result.Packages, model.PointPackage{Name: p.PackageName, Remain: remain, Used: used, Total: total, ExpiresAt: p.PackageEndTime})
+		expiresAt := p.PackageEndTime
+		if expiresAt == "" {
+			expiresAt = p.CycleEndTime
+		}
+		result.Packages = append(result.Packages, model.PointPackage{Name: p.PackageName, Remain: remain, Used: used, Total: total, ExpiresAt: expiresAt})
 	}
-	return result, nil
+}
+
+func (c *Client) Points(a *model.Account) (PointResult, error) {
+	now := time.Now()
+	result := PointResult{}
+	expectedTotal := -1
+
+	for pageNumber := 1; pageNumber <= pointsMaxPages; pageNumber++ {
+		packages, totalCount, err := c.pointsPage(a, now, pageNumber)
+		if err != nil {
+			return PointResult{}, err
+		}
+		if totalCount != nil {
+			if *totalCount < 0 || *totalCount > pointsPageSize*pointsMaxPages {
+				return PointResult{}, &Error{Kind: KindProtocol, Msg: "积分套餐总数异常"}
+			}
+			if expectedTotal < 0 {
+				expectedTotal = *totalCount
+			} else if expectedTotal != *totalCount {
+				return PointResult{}, &Error{Kind: KindProtocol, Msg: "积分分页总数在查询过程中发生变化，请重试"}
+			}
+		}
+
+		if len(packages) == 0 {
+			if expectedTotal < 0 || len(result.Packages) >= expectedTotal {
+				return result, nil
+			}
+			return PointResult{}, &Error{Kind: KindProtocol, Msg: "积分包分页不完整，请重试"}
+		}
+		appendPointsPackages(&result, packages)
+
+		if expectedTotal >= 0 {
+			if len(result.Packages) > expectedTotal {
+				return PointResult{}, &Error{Kind: KindProtocol, Msg: "积分分页返回了重复或超量套餐"}
+			}
+			if len(result.Packages) == expectedTotal {
+				return result, nil
+			}
+			continue
+		}
+
+		if len(packages) < pointsPageSize {
+			return result, nil
+		}
+		// 旧服务端偶尔省略 TotalCount。满页时继续探测下一页，直到短页/空页；
+		// 外层 pointsMaxPages 仍限制最坏情况下的请求次数。
+		continue
+	}
+
+	return PointResult{}, &Error{Kind: KindProtocol, Msg: "积分包分页超过安全上限"}
 }
 
 func packageValues(cycleRemain, cycleUsed, cycleSize, remain, used, size int64) (int64, int64, int64) {

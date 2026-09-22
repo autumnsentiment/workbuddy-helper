@@ -6,9 +6,14 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-      # 默认只监听容器内 127.0.0.1。需要从宿主机访问界面时改为 0.0.0.0，
-      # 并务必只在受信任的内网使用（界面无登录口令，依赖端口访问控制）。
-      - WBH_HOST=127.0.0.1
+      # 容器内必须监听 0.0.0.0 才能接收 Docker 端口转发；宿主机端口
+      # 仍默认只绑定回环地址，远程访问请配合 SSH 隧道或可信反向代理。
+      - WBH_HOST=0.0.0.0
+      # 通过反向代理域名访问时显式列出 Host，例如：
+      # - WBH_ALLOWED_HOSTS=panel.example.com:8443
+      # 远程面板建议同时启用 Basic Auth（不要把真实密码提交到仓库）：
+      # - WBH_AUTH_USER=admin
+      # - WBH_AUTH_PASSWORD=change-me
       - WBH_DATA=/data
     # 把宿主机本地的可移植账号目录挂载到 /data（含 key.bin + state.bin）。
     # 若目录为空，容器会生成新的空数据目录，之后通过界面添加账号。

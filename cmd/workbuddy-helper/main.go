@@ -29,7 +29,7 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
-// appVersion 由构建脚本通过 -ldflags 注入（如 1.0.2）
+// appVersion 由构建脚本通过 -ldflags 注入（如 1.0.6）
 var appVersion = "dev"
 
 func main() {
@@ -57,6 +57,13 @@ func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.LUTC)
 	server.SetVersion(appVersion)
 
+	st := store.New(*dataDir)
+	instanceLock, err := acquireDataDirLock(*dataDir)
+	if err != nil {
+		fatal("%v", err)
+	}
+	defer instanceLock.Close()
+
 	if *exportPortable != "" {
 		runExport(defaultExportSource(*dataDir), *exportPortable)
 		return
@@ -66,12 +73,6 @@ func main() {
 		return
 	}
 
-	st := store.New(*dataDir)
-	instanceLock, err := instance.Acquire(*dataDir)
-	if err != nil {
-		fatal("%v", err)
-	}
-	defer instanceLock.Close()
 	svc, err := service.New(st, client.New())
 	if err != nil {
 		fatal("无法加载本地数据: %v", err)
@@ -140,6 +141,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = appServer.Shutdown(ctx)
+}
+
+// acquireDataDirLock is shared by normal service startup and the data
+// management commands so import/export cannot race a running helper.
+func acquireDataDirLock(dataDir string) (*instance.Lock, error) {
+	return instance.Acquire(dataDir)
 }
 
 func runExport(srcFile, dstDir string) {
