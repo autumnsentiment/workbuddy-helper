@@ -1058,7 +1058,16 @@ const DefaultActivePrompt = "你是谁，谁开发你的，现在是什么时间
 // 逆向实测：第一条消息必须是 system，否则返回 400 code=11128。
 // prompt 为用户消息内容：过短问候（如 "hi"）可能被服务端判定为非有效会话，
 // 自定义更自然的多句提问可提高会话有效性；prompt 留空使用 DefaultActivePrompt。
+type ActiveChatResult struct {
+	ReportWarning error
+}
+
 func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
+	_, err := c.ActiveChatWithResult(a, modelName, prompt)
+	return err
+}
+
+func (c *Client) ActiveChatWithResult(a *model.Account, modelName, prompt string) (ActiveChatResult, error) {
 	if strings.TrimSpace(modelName) == "" {
 		modelName = "hy3"
 	}
@@ -1107,7 +1116,7 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 	})
 	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/v2/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return ActiveChatResult{}, err
 	}
 	chatHeaders(req, a)
 	req.Header.Set("X-Conversation-ID", convID)
@@ -1123,35 +1132,125 @@ func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return &Error{Kind: KindTransport, Msg: err.Error()}
+		return ActiveChatResult{}, &Error{Kind: KindTransport, Msg: err.Error()}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		raw, readErr := readResponseBody(resp.Body, 2<<20)
 		if readErr != nil {
 			if errors.Is(readErr, errResponseTooLarge) {
-				return &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "响应内容过大"}
+				return ActiveChatResult{}, &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "响应内容过大"}
 			}
-			return &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取响应失败: " + readErr.Error()}
+			return ActiveChatResult{}, &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取响应失败: " + readErr.Error()}
 		}
 		var env envelope
 		if json.Unmarshal(raw, &env) == nil && (env.Code != 0 || env.Msg != "") {
-			return classifyBusiness(resp.StatusCode, env.Code, env.Msg)
+			return ActiveChatResult{}, classifyBusiness(resp.StatusCode, env.Code, env.Msg)
 		}
-		return classifyHTTP(resp.StatusCode, string(raw))
+		return ActiveChatResult{}, classifyHTTP(resp.StatusCode, string(raw))
 	}
-	// 2xx：读完整个 SSE 流（max_tokens 很小，秒级结束），确保服务端完整受理本次会话。
-	// 同时限制最大响应体，避免异常上游令活跃操作无界读取。
-	if err := drainResponseBody(resp.Body, 2<<20); err != nil {
+	// A successful HTTP status alone does not mean the streamed chat completed.
+	raw, err := readResponseBody(resp.Body, 2<<20)
+	if err != nil {
 		if errors.Is(err, errResponseTooLarge) {
-			return &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "对话响应内容过大"}
+			return ActiveChatResult{}, &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "对话响应内容过大"}
 		}
-		return &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取对话响应失败: " + err.Error()}
+		return ActiveChatResult{}, &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取对话响应失败: " + err.Error()}
+	}
+	if err := validateActiveChatResponse(raw); err != nil {
+		return ActiveChatResult{}, err
 	}
 
 	// 备用通道：桌面端主路径是请求体 extra_vars.growthEvent（上方已带），
-	// 这里再补一次独立遥测上报（部分服务端路径从 /v2/report 读取），失败不阻断。
-	_ = c.reportChatEvent(a, prompt, modelName, convID, reqID, req.Header.Get("X-Conversation-Message-ID"))
+	// 这里再补一次独立遥测上报。失败应可见，但不能抹掉已成功的对话。
+	warning := c.reportChatEvent(a, prompt, modelName, convID, reqID, req.Header.Get("X-Conversation-Message-ID"))
+	return ActiveChatResult{ReportWarning: warning}, nil
+}
+
+func validateActiveChatResponse(raw []byte) error {
+	var sawAnswer bool
+	var eventName string
+	var dataLines []string
+	checkEvent := func() error {
+		if len(dataLines) == 0 {
+			eventName = ""
+			return nil
+		}
+		data := strings.TrimSpace(strings.Join(dataLines, "\n"))
+		dataLines = nil
+		name := eventName
+		eventName = ""
+		if data == "[DONE]" {
+			return nil
+		}
+		var packet struct {
+			Code    int             `json:"code"`
+			Msg     string          `json:"msg"`
+			Error   json.RawMessage `json:"error"`
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+				Text string `json:"text"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &packet); err != nil {
+			return &Error{Kind: KindProtocol, Msg: "对话流包含无效 JSON"}
+		}
+		if packet.Code != 0 {
+			return classifyBusiness(http.StatusOK, packet.Code, packet.Msg)
+		}
+		if len(packet.Error) > 0 && string(packet.Error) != "null" {
+			var detail struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+				Msg     string `json:"msg"`
+			}
+			if json.Unmarshal(packet.Error, &detail) != nil {
+				_ = json.Unmarshal(packet.Error, &detail.Message)
+			}
+			message := detail.Message
+			if message == "" {
+				message = detail.Msg
+			}
+			if message == "" {
+				message = "对话流返回错误"
+			}
+			return classifyBusiness(http.StatusOK, detail.Code, short(message, 180))
+		}
+		if name == "error" {
+			return &Error{Kind: KindBusiness, Msg: short(data, 180)}
+		}
+		for _, choice := range packet.Choices {
+			if strings.TrimSpace(choice.Delta.Content) != "" ||
+				strings.TrimSpace(choice.Message.Content) != "" ||
+				strings.TrimSpace(choice.Text) != "" {
+				sawAnswer = true
+			}
+		}
+		return nil
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
+		switch {
+		case line == "":
+			if err := checkEvent(); err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, "event:"):
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		case strings.HasPrefix(line, "data:"):
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := checkEvent(); err != nil {
+		return err
+	}
+	if !sawAnswer {
+		return &Error{Kind: KindProtocol, Msg: "对话未返回有效回答，不能确认活跃"}
+	}
 	return nil
 }
 
@@ -1236,11 +1335,25 @@ func (c *Client) reportChatEvent(a *model.Account, prompt, modelName, convID, re
 		return &Error{Kind: KindTransport, Msg: err.Error()}
 	}
 	defer resp.Body.Close()
-	if err := drainResponseBody(resp.Body, 2<<20); err != nil {
+	raw, err := readResponseBody(resp.Body, 2<<20)
+	if err != nil {
 		if errors.Is(err, errResponseTooLarge) {
 			return &Error{Kind: KindProtocol, Status: resp.StatusCode, Msg: "遥测响应内容过大"}
 		}
 		return &Error{Kind: KindTransport, Status: resp.StatusCode, Msg: "读取遥测响应失败: " + err.Error()}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		var env envelope
+		if json.Unmarshal(raw, &env) == nil && (env.Code != 0 || env.Msg != "") {
+			return classifyBusiness(resp.StatusCode, env.Code, env.Msg)
+		}
+		return classifyHTTP(resp.StatusCode, string(raw))
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		var env envelope
+		if json.Unmarshal(raw, &env) == nil && env.Code != 0 {
+			return classifyBusiness(resp.StatusCode, env.Code, env.Msg)
+		}
 	}
 	return nil
 }

@@ -29,7 +29,7 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
-// appVersion 由构建脚本通过 -ldflags 注入（如 1.0.6）
+// appVersion 由构建脚本通过 -ldflags 注入（如 1.0.7）
 var appVersion = "dev"
 
 func main() {

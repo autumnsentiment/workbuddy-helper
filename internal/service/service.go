@@ -924,41 +924,61 @@ func (s *Service) ActiveChat(id string, force bool) (model.PublicAccount, error)
 	if err != nil {
 		return a.Public(), err
 	}
-	if !force && a.LastActiveDate == today() && a.LastActive == "confirmed" {
-		s.markStatus(id, a.LastActive, "今日已活跃，跳过重复对话")
+	if !force && a.LastActiveDate == today() &&
+		(a.LastActive == "confirmed" || a.LastActive == "credited") {
+		s.markStatus(id, a.LastActive, "今日已发送活跃会话，跳过重复对话")
 		_ = s.refreshPoints(id, a)
 		updated, _ := s.getAccount(id)
 		return updated.Public(), nil
 	}
 	activeModel, activePrompt, delay := s.activeConfig()
+	// A working token and billing session are prerequisites, not an optional
+	// baseline. Do not claim activity when this account cannot query its points.
+	if err := s.refreshPoints(id, a); err != nil {
+		if !client.IsKind(err, client.KindAuthDead) {
+			updated, _ := s.getAccount(id)
+			return updated.Public(), err
+		}
+		if refreshErr := s.refreshAccount(id, &a); refreshErr != nil {
+			updated, _ := s.getAccount(id)
+			return updated.Public(), refreshErr
+		}
+		if err = s.refreshPoints(id, a); err != nil {
+			updated, _ := s.getAccount(id)
+			return updated.Public(), err
+		}
+	}
 	s.markStatus(id, "running", "正在发送活跃会话")
-	// 先刷新一次积分作为基线，供延迟复核对比到账变化
-	_ = s.refreshPoints(id, a)
-	err = s.apiclientFor(&a).ActiveChat(&a, activeModel, activePrompt)
+	result, err := s.apiclientFor(&a).ActiveChatWithResult(&a, activeModel, activePrompt)
 	if client.IsKind(err, client.KindAuthDead) {
 		if refreshErr := s.refreshAccount(id, &a); refreshErr == nil {
-			err = s.apiclientFor(&a).ActiveChat(&a, activeModel, activePrompt)
+			result, err = s.apiclientFor(&a).ActiveChatWithResult(&a, activeModel, activePrompt)
 		} else {
-			return a.Public(), refreshErr
+			updated, _ := s.getAccount(id)
+			return updated.Public(), refreshErr
 		}
 	}
 	if err != nil {
 		s.markError(id, err)
-		return a.Public(), err
+		updated, _ := s.getAccount(id)
+		return updated.Public(), err
 	}
 	now := time.Now()
 	if err := s.updateAccount(id, func(dst *model.Account) {
 		dst.LastActiveAt = now
 		dst.LastActiveDate = today()
 		dst.LastActive = "confirmed"
-		dst.LastActiveMsg = "活跃会话已发送"
-		dst.Status = "confirmed"
+		dst.LastActiveMsg = "会话已发送，待积分复核"
+		dst.Status = "ready"
 		dst.LastError = ""
 		dst.BalanceBeforeActive = dst.Balance
 		dst.PendingRecheckAt = now.Add(delay)
 		dst.RecheckAttempts = 0
 	}); err != nil {
 		return a.Public(), err
+	}
+	if result.ReportWarning != nil {
+		s.appendLog("warn", id, "活跃对话已返回有效回答，但备用遥测上报失败："+sanitize(result.ReportWarning.Error()))
 	}
 	promptDesc := activePrompt
 	if promptDesc == "" {
@@ -1223,6 +1243,8 @@ func (s *Service) recheckAccount(id string) {
 			dst.PendingRecheckAt = time.Time{}
 			dst.RecheckAttempts = 0
 			dst.BalanceBeforeActive = 0
+			dst.LastActive = "credited"
+			dst.LastActiveMsg = fmt.Sprintf("积分已到账（+%d）", delta)
 		}); err != nil {
 			return
 		}
@@ -1232,6 +1254,7 @@ func (s *Service) recheckAccount(id string) {
 			dst.PendingRecheckAt = time.Time{}
 			dst.RecheckAttempts = attempts
 			dst.BalanceBeforeActive = 0
+			dst.LastActiveMsg = "积分复核未见到账，可稍后手动刷新"
 		}); err != nil {
 			return
 		}

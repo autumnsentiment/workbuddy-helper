@@ -383,15 +383,18 @@
     return { key: "unknown", label: "暂无记录", className: "checkin-unknown" };
   }
 
-  // 国际版活跃状态：LastActive confirmed 且日期为今天 → 已活跃
+  // A completed chat is not proof that delayed activity credits arrived.
   function getActiveState(account) {
     const state = String(account.lastActive ?? "").toLowerCase();
     const isToday = account.lastActiveDate === localDateKey();
-    if (isToday && state === "confirmed") {
-      return { key: "done", label: "已活跃", className: "checkin-done" };
+    if (isToday && state === "credited") {
+      return { key: "done", label: "积分已到账", className: "checkin-done" };
     }
-    if (state === "confirmed" && !isToday) {
-      return { key: "pending", label: "未活跃", className: "checkin-pending" };
+    if (isToday && state === "confirmed") {
+      const label = account.pendingRecheckAt
+        ? "已发送待复核"
+        : (Number(account.recheckAttempts) >= 6 ? "复核未到账" : "已发送未确认");
+      return { key: "done", label, className: "checkin-pending" };
     }
     if (["failed", "error"].includes(state)) {
       return { key: "error", label: "活跃失败", className: "checkin-error" };
@@ -475,7 +478,7 @@
 
     elements.summaryTotal.textContent = integerFormatter.format(app.accounts.length);
     elements.summaryChecked.textContent = integerFormatter.format(checked);
-    elements.summaryCheckedLabel.textContent = intl ? "今日已活跃" : "今日已签到";
+    elements.summaryCheckedLabel.textContent = intl ? "今日已发送" : "今日已签到";
     elements.summaryEnabled.textContent = integerFormatter.format(enabled);
     elements.summaryPoints.textContent = pointsValues.length ? numberFormatter.format(pointsTotal) : "--";
   }
@@ -772,7 +775,7 @@
       } else if (action === "delete") {
         result = await api(`/api/accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
       }
-      toast(result?.message || `${actionNames[action]}成功`);
+      toast(result?.message || (action === "active" ? "会话已发送，等待积分复核" : `${actionNames[action]}成功`));
       await loadState({ quiet: true });
     } catch (error) {
       toast(`${actionNames[action]}失败：${getErrorMessage(error)}`, "error");
@@ -797,11 +800,11 @@
         method: "POST",
         body: JSON.stringify({ version: app.viewVersion }),
       });
-      const successCount = firstDefined(result?.successCount, result?.succeeded, result?.success);
-      const message = typeof successCount === "number"
-        ? `批量${intl ? "活跃" : "签到"}完成，成功 ${integerFormatter.format(successCount)} 个账户`
-        : result?.message || `批量${intl ? "活跃" : "签到"}已完成`;
-      toast(message);
+      const accounts = Array.isArray(result?.accounts) ? result.accounts : [];
+      const failed = accounts.filter((account) => account.lastError).length;
+      const succeeded = accounts.length - failed;
+      const action = intl ? "活跃会话" : "签到";
+      toast(`${action}已处理 ${integerFormatter.format(accounts.length)} 个账户，成功 ${integerFormatter.format(succeeded)} 个${intl ? "（积分待复核）" : ""}${failed ? `，失败 ${integerFormatter.format(failed)} 个` : ""}`, failed ? "error" : "success");
       await loadState({ quiet: true });
     } catch (error) {
       toast(`批量${intl ? "活跃" : "签到"}失败：${getErrorMessage(error)}`, "error");

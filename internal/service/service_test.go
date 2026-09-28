@@ -207,6 +207,9 @@ func TestActiveChatSchedulesPointsRecheck(t *testing.T) {
 	if account.LastActive != "confirmed" || account.LastActiveDate != today() || account.PendingRecheckAt.IsZero() {
 		t.Fatalf("unexpected account: %+v", account)
 	}
+	if account.LastActiveMsg != "会话已发送，待积分复核" {
+		t.Fatalf("activity was presented as credited: %q", account.LastActiveMsg)
+	}
 	if account.Balance != 80 {
 		t.Fatalf("baseline balance=%d", account.Balance)
 	}
@@ -231,8 +234,55 @@ func TestActiveChatSchedulesPointsRecheck(t *testing.T) {
 	}
 	svc.runPendingRechecks()
 	updated, _ = svc.getAccount("a1")
-	if !updated.PendingRecheckAt.IsZero() || updated.Balance != 110 {
-		t.Fatalf("pending=%v balance=%d", updated.PendingRecheckAt, updated.Balance)
+	if !updated.PendingRecheckAt.IsZero() || updated.Balance != 110 || updated.LastActive != "credited" {
+		t.Fatalf("pending=%v balance=%d active=%s", updated.PendingRecheckAt, updated.Balance, updated.LastActive)
+	}
+}
+
+func TestActiveChatRequiresSuccessfulPointsPreflight(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		code      int
+		wantLogin bool
+	}{
+		{name: "billing unavailable", status: http.StatusServiceUnavailable, code: 500},
+		{name: "session expired", status: http.StatusUnauthorized, code: 12153, wantLogin: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chats := 0
+			svc, closeUpstream := newAccountService(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v2/billing/meter/get-user-resource":
+					writeEnvelope(w, tc.status, tc.code, "session unavailable", `{}`)
+				case "/v2/plugin/auth/token/refresh":
+					writeEnvelope(w, http.StatusUnauthorized, 12153, "session expired", `{}`)
+				case "/v2/chat/completions":
+					chats++
+					_, _ = w.Write([]byte(chatOK))
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			defer closeUpstream()
+			svc.mu.Lock()
+			svc.state.Accounts[0].Version = model.ModeIntl
+			svc.state.Accounts[0].Domain = "workbuddy.ai"
+			oldIntl := svc.clientIntl
+			intlClient := *oldIntl
+			intlClient.HTTP = svc.clientCN.HTTP
+			svc.clientIntl = &intlClient
+			svc.mu.Unlock()
+			oldIntl.CloseIdleConnections()
+
+			account, err := svc.ActiveChat("a1", false)
+			if err == nil || chats != 0 || account.LastActive == "confirmed" || !account.PendingRecheckAt.IsZero() {
+				t.Fatalf("err=%v chats=%d account=%+v", err, chats, account)
+			}
+			if tc.wantLogin && account.Status != "needs_login" {
+				t.Fatalf("expired session status=%s", account.Status)
+			}
+		})
 	}
 }
 

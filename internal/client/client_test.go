@@ -358,6 +358,49 @@ func TestActiveChatRejectsRedirectStatus(t *testing.T) {
 	}
 }
 
+func TestActiveChatRejectsStreamWithoutAnswer(t *testing.T) {
+	for _, body := range []string{
+		"",
+		"data: [DONE]\n\n",
+		"data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n",
+	} {
+		reports := 0
+		c := testClient(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/v2/report" {
+				reports++
+			}
+			return response(http.StatusOK, body), nil
+		})
+		err := c.ActiveChat(&model.Account{AccessToken: "at", Version: model.ModeIntl}, "hy3", "")
+		if !IsKind(err, KindProtocol) || reports != 0 {
+			t.Fatalf("body=%q err=%v reports=%d", body, err, reports)
+		}
+	}
+}
+
+func TestActiveChatRejectsSSEBusinessError(t *testing.T) {
+	c := testClient(func(*http.Request) (*http.Response, error) {
+		return response(http.StatusOK, "event: error\ndata: {\"code\":12153,\"msg\":\"Offline user session not found\"}\n\n"), nil
+	})
+	err := c.ActiveChat(&model.Account{AccessToken: "at", Version: model.ModeIntl}, "hy3", "")
+	if !IsKind(err, KindAuthDead) {
+		t.Fatalf("stream auth error should be actionable: %v", err)
+	}
+}
+
+func TestActiveChatReportsTelemetryWarningWithoutDiscardingAnswer(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/v2/report" {
+			return response(http.StatusServiceUnavailable, `{"code":0,"msg":"unavailable"}`), nil
+		}
+		return response(http.StatusOK, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"), nil
+	})
+	result, err := c.ActiveChatWithResult(&model.Account{AccessToken: "at", Version: model.ModeIntl}, "hy3", "")
+	if err != nil || !IsKind(result.ReportWarning, KindServer) {
+		t.Fatalf("chat err=%v, report warning=%v", err, result.ReportWarning)
+	}
+}
+
 func TestValidateProxyURL(t *testing.T) {
 	cases := []struct {
 		url  string
