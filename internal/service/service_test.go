@@ -166,7 +166,7 @@ func TestCheckinRefreshesOnceAfterUnauthorized(t *testing.T) {
 	}
 }
 
-const chatOK = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+const chatOK = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
 
 func TestActiveChatSchedulesPointsRecheck(t *testing.T) {
 	chats, pointQueries := 0, 0
@@ -236,6 +236,41 @@ func TestActiveChatSchedulesPointsRecheck(t *testing.T) {
 	updated, _ = svc.getAccount("a1")
 	if !updated.PendingRecheckAt.IsZero() || updated.Balance != 110 || updated.LastActive != "credited" {
 		t.Fatalf("pending=%v balance=%d active=%s", updated.PendingRecheckAt, updated.Balance, updated.LastActive)
+	}
+}
+
+func TestManualPointsRefreshConfirmsDelayedCredit(t *testing.T) {
+	currentPointsData := pointsDataInitial
+	svc, closeUpstream := newAccountService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/chat/completions":
+			_, _ = w.Write([]byte(chatOK))
+		case "/v2/billing/meter/get-user-resource":
+			writeEnvelope(w, http.StatusOK, 0, "ok", currentPointsData)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer closeUpstream()
+	svc.mu.Lock()
+	svc.state.Accounts[0].Version = model.ModeIntl
+	oldIntl := svc.clientIntl
+	intlClient := *oldIntl
+	intlClient.HTTP = svc.clientCN.HTTP
+	svc.clientIntl = &intlClient
+	svc.mu.Unlock()
+	oldIntl.CloseIdleConnections()
+
+	if _, err := svc.ActiveChat("a1", false); err != nil {
+		t.Fatal(err)
+	}
+	currentPointsData = pointsDataCredited
+	account, err := svc.Points("a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.LastActive != "credited" || !account.PendingRecheckAt.IsZero() || account.Balance != 110 {
+		t.Fatalf("manual refresh did not confirm credited state: %+v", account)
 	}
 }
 

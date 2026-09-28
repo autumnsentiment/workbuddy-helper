@@ -999,7 +999,9 @@ func (s *Service) refreshPoints(id string, a model.Account) error {
 		return err
 	}
 	now := time.Now()
-	return s.updateAccount(id, func(dst *model.Account) {
+	credited := false
+	var before int64
+	err = s.updateAccount(id, func(dst *model.Account) {
 		dst.Balance = result.Balance
 		dst.Used = result.Used
 		dst.Total = result.Total
@@ -1009,7 +1011,21 @@ func (s *Service) refreshPoints(id string, a model.Account) error {
 		if dst.Status == "running" || dst.Status == "error" || dst.Status == "rate_limited" {
 			dst.Status = "ready"
 		}
+		if !dst.PendingRecheckAt.IsZero() &&
+			result.Balance > dst.BalanceBeforeActive {
+			before = dst.BalanceBeforeActive
+			dst.PendingRecheckAt = time.Time{}
+			dst.RecheckAttempts = 0
+			dst.BalanceBeforeActive = 0
+			dst.LastActive = "credited"
+			dst.LastActiveMsg = fmt.Sprintf("积分已到账（+%d）", result.Balance-before)
+			credited = true
+		}
 	})
+	if err == nil && credited {
+		s.appendLog("info", id, fmt.Sprintf("积分已到账：%d → %d（+%d）", before, result.Balance, result.Balance-before))
+	}
+	return err
 }
 
 func (s *Service) Points(id string) (model.PublicAccount, error) {
@@ -1211,7 +1227,6 @@ func (s *Service) recheckAccount(id string) {
 	}
 	// delay 须在 updateAccount（持有写锁）之外取好，回调内不能再调 s.recheckDelay()
 	delay := s.recheckDelay()
-	before := a.BalanceBeforeActive
 	if refreshErr := s.refreshPoints(id, a); refreshErr != nil {
 		// 与手动积分查询保持一致：积分接口返回会话失效时，先刷新令牌，
 		// 再重试一次查询。否则失效账号会永远按延迟重排，既无法到账复核，
@@ -1235,21 +1250,11 @@ func (s *Service) recheckAccount(id string) {
 	if err != nil {
 		return
 	}
-	delta := latest.Balance - before
+	if latest.PendingRecheckAt.IsZero() {
+		return
+	}
 	attempts := latest.RecheckAttempts + 1
-	switch {
-	case delta > 0:
-		if err := s.updateAccount(id, func(dst *model.Account) {
-			dst.PendingRecheckAt = time.Time{}
-			dst.RecheckAttempts = 0
-			dst.BalanceBeforeActive = 0
-			dst.LastActive = "credited"
-			dst.LastActiveMsg = fmt.Sprintf("积分已到账（+%d）", delta)
-		}); err != nil {
-			return
-		}
-		s.appendLog("info", id, fmt.Sprintf("积分已到账：%d → %d（+%d）", before, latest.Balance, delta))
-	case attempts >= 6:
+	if attempts >= 6 {
 		if err := s.updateAccount(id, func(dst *model.Account) {
 			dst.PendingRecheckAt = time.Time{}
 			dst.RecheckAttempts = attempts
@@ -1259,15 +1264,15 @@ func (s *Service) recheckAccount(id string) {
 			return
 		}
 		s.appendLog("info", id, fmt.Sprintf("积分复核 %d 次暂无变化（余额 %d），停止自动复核，可稍后手动刷新", attempts, latest.Balance))
-	default:
-		if err := s.updateAccount(id, func(dst *model.Account) {
-			dst.RecheckAttempts = attempts
-			dst.PendingRecheckAt = time.Now().Add(delay)
-		}); err != nil {
-			return
-		}
-		s.appendLog("info", id, fmt.Sprintf("积分暂未到账（余额 %d），已排期第 %d 次复核", latest.Balance, attempts+1))
+		return
 	}
+	if err := s.updateAccount(id, func(dst *model.Account) {
+		dst.RecheckAttempts = attempts
+		dst.PendingRecheckAt = time.Now().Add(delay)
+	}); err != nil {
+		return
+	}
+	s.appendLog("info", id, fmt.Sprintf("积分暂未到账（余额 %d），已排期第 %d 次复核", latest.Balance, attempts+1))
 }
 
 func (s *Service) appendLog(level, accountID, message string) {
