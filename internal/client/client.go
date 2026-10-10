@@ -936,6 +936,11 @@ func isAuthorizationPendingError(err error) bool {
 	if !errors.As(err, &ce) || ce.Kind != KindBusiness {
 		return false
 	}
+	// The current token endpoint reports an unfinished browser authorization as
+	// HTTP 200 with business code 11217 ("login ing...").
+	if ce.Code == 11217 {
+		return true
+	}
 	if ce.Status != http.StatusBadRequest && ce.Status != http.StatusConflict {
 		return false
 	}

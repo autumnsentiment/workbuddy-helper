@@ -173,7 +173,9 @@ func TestPollLoginPendingResponseReleasesSessionClaim(t *testing.T) {
 		switch r.URL.Path {
 		case "/v2/plugin/auth/token":
 			if tokenCalls.Add(1) == 1 {
-				writeLoginEnvelope(w, http.StatusBadRequest, 1001, `{}`)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprint(w, `{"code":11217,"msg":"login ing...","data":{}}`)
 				return
 			}
 			writeLoginEnvelope(w, http.StatusOK, 0, `{"accessToken":"login-access","refreshToken":"login-refresh","expiresIn":3600,"domain":"codebuddy.cn"}`)
@@ -187,7 +189,7 @@ func TestPollLoginPendingResponseReleasesSessionClaim(t *testing.T) {
 	registerLoginSession(svc, "pending-login", "pending-state")
 
 	if _, err := svc.PollLogin("pending-login"); err == nil || !strings.Contains(err.Error(), "尚未完成") {
-		t.Fatalf("首次未完成轮询返回异常: %v", err)
+		t.Fatalf("HTTP 200 + code 11217 未被识别为等待授权: %v", err)
 	}
 	svc.loginMu.Lock()
 	sessionRetained := svc.logins["pending-login"] != nil

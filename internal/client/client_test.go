@@ -567,6 +567,8 @@ func TestLoginSessionPollClassifiesPendingAndFatalStatuses(t *testing.T) {
 		wantPending bool
 	}{
 		{name: "authorization pending code", status: http.StatusBadRequest, body: `{"code":1001,"msg":"authorization pending"}`, wantKind: KindBusiness, wantCode: 1001, wantPending: true},
+		{name: "authorization in progress code", status: http.StatusOK, body: `{"code":11217,"msg":"login ing..."}`, wantKind: KindBusiness, wantCode: 11217, wantPending: true},
+		{name: "other HTTP 200 business code", status: http.StatusOK, body: `{"code":1002,"msg":"login forbidden"}`, wantKind: KindBusiness, wantCode: 1002},
 		{name: "authorization pending message", status: http.StatusConflict, body: `{"code":0,"msg":"waiting for authorization"}`, wantKind: KindBusiness, wantPending: true},
 		{name: "unauthorized", status: http.StatusUnauthorized, body: `{"code":12153,"msg":"offline user session not found"}`, wantKind: KindAuthDead},
 		{name: "forbidden", status: http.StatusForbidden, body: `{"code":1002,"msg":"login forbidden"}`, wantKind: KindBusiness},

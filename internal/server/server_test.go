@@ -434,6 +434,8 @@ func TestIsLoginPendingOnlyAcceptsExplicitAuthorizationPending(t *testing.T) {
 	}{
 		{name: "local concurrent poll", err: &client.Error{Kind: client.KindBusiness, Msg: "登录尚未完成：已有轮询请求正在处理"}, want: true},
 		{name: "known code", err: &client.Error{Kind: client.KindBusiness, Status: http.StatusBadRequest, Code: 1001, Msg: "temporary"}, want: true},
+		{name: "login in progress HTTP 200", err: &client.Error{Kind: client.KindBusiness, Status: http.StatusOK, Code: 11217, Msg: "login ing..."}, want: true},
+		{name: "unrecognized HTTP 200 business code", err: &client.Error{Kind: client.KindBusiness, Status: http.StatusOK, Code: 1002, Msg: "login forbidden"}, want: false},
 		{name: "known message", err: &client.Error{Kind: client.KindBusiness, Status: http.StatusConflict, Msg: "authorization pending"}, want: true},
 		{name: "auth failure", err: &client.Error{Kind: client.KindAuthDead, Status: http.StatusUnauthorized, Msg: "waiting for login"}, want: false},
 		{name: "forbidden waiting text", err: &client.Error{Kind: client.KindBusiness, Status: http.StatusForbidden, Msg: "waiting for authorization"}, want: false},

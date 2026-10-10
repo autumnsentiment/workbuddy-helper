@@ -365,6 +365,11 @@ func isLoginPending(err error) bool {
 	if ce.Status == 0 && strings.TrimSpace(ce.Msg) == "登录尚未完成：已有轮询请求正在处理" {
 		return true
 	}
+	// The upstream token endpoint uses HTTP 200 + code 11217 while the user
+	// is still completing browser authorization.
+	if ce.Code == 11217 {
+		return true
+	}
 	// Keep this in sync with the client-side token poll predicate. An error
 	// from a different 4xx endpoint must not turn into an endless pending loop
 	// merely because its message happens to contain "waiting".
