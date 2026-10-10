@@ -274,6 +274,29 @@ func TestRefreshDoesNotFollowRedirect(t *testing.T) {
 	}
 }
 
+func TestRefreshUsesJWTExpiryClaim(t *testing.T) {
+	const expiry int64 = 1893456000
+	// The signature is intentionally not verified by the helper; this fixture
+	// only exercises extraction of the NumericDate `exp` claim for display.
+	const accessToken = "eyJhbGciOiJub25lIn0.eyJleHAiOjE4OTM0NTYwMDB9.signature"
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/v2/plugin/auth/token/refresh" {
+			return nil, errors.New("unexpected path: " + r.URL.Path)
+		}
+		return response(http.StatusOK, `{"code":0,"data":{"accessToken":"`+accessToken+`","refreshToken":"next-refresh","expiresIn":3600}}`), nil
+	})
+	account := &model.Account{RefreshToken: "old-refresh"}
+	if err := c.Refresh(account); err != nil {
+		t.Fatal(err)
+	}
+	if account.AccessToken != accessToken || account.RefreshToken != "next-refresh" {
+		t.Fatalf("refresh credentials not updated: %+v", account)
+	}
+	if account.ExpiresAt != expiry {
+		t.Fatalf("expiresAt=%d, want JWT exp %d", account.ExpiresAt, expiry)
+	}
+}
+
 func TestActiveChatSendsClientConversation(t *testing.T) {
 	var gotPath, gotUA, gotProduct, gotAuth, gotUID, gotBody, gotIDEType string
 	var paths []string

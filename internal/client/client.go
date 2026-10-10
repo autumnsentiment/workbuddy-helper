@@ -997,10 +997,13 @@ func (c *Client) Refresh(a *model.Account) error {
 	if tok.Domain != "" {
 		a.Domain = tok.Domain
 	}
+	now := time.Now()
 	if tok.ExpiresIn > 0 {
-		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	} else if a.ExpiresAt <= time.Now().Unix() {
-		a.ExpiresAt = time.Now().Add(15 * time.Minute).Unix()
+		a.ExpiresAt = model.ResolveTokenExpiresAt(tok.AccessToken, tok.ExpiresIn, now)
+	} else if expiresAt, ok := model.JWTExpiryUnix(tok.AccessToken); ok {
+		a.ExpiresAt = expiresAt
+	} else if a.ExpiresAt <= now.Unix() {
+		a.ExpiresAt = now.Add(15 * time.Minute).Unix()
 	}
 	return nil
 }

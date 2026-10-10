@@ -320,7 +320,7 @@ workbuddy-helper/
 |---|---|---|
 | GET | `/` | 看板页面（注入一次性 app-token） |
 | GET | `/healthz` | 健康检查 |
-| GET | `/api/state` | 账号与汇总（不含令牌） |
+| GET | `/api/state` | 账号与汇总（不含令牌；账号包含可选的 `tokenExpiresAt`，为 Unix 秒时间戳） |
 | GET | `/api/logs?limit=` | 运行日志 |
 | POST | `/api/login/start` | 开始登录（返回授权 URL） |
 | POST | `/api/login/poll` | 轮询登录结果 |
@@ -334,6 +334,8 @@ workbuddy-helper/
 | DELETE | `/api/accounts/{id}` | 删除账号 |
 
 写操作需携带页面注入的 `X-App-Token`，且 `Origin` 必须与请求 `Host` 同源（或为本机回环），以防御 CSRF。
+
+`tokenExpiresAt` 仅表示访问令牌的预计到期时间，服务端会优先读取 JWT 的 `exp` 声明，无法解析时回退到登录/刷新接口提供的 `expiresIn`。接口不会返回 JWT、Access Token 或 Refresh Token 本体；旧账号或上游未提供有效期时会省略该字段。
 
 ---
 

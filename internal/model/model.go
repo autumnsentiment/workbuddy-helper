@@ -1,6 +1,9 @@
 package model
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -52,6 +55,62 @@ type Account struct {
 	Packages            []PointPackage `json:"packages,omitempty"`
 	CreatedAt           time.Time      `json:"createdAt"`
 	UpdatedAt           time.Time      `json:"updatedAt"`
+}
+
+// JWTExpiryUnix returns the exp claim from a compact JWT as Unix seconds.
+//
+// The access token payload is decoded only for display and refresh bookkeeping;
+// no signature verification is attempted because the helper does not have the
+// issuer's signing keys.
+func JWTExpiryUnix(token string) (int64, bool) {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) != 3 || parts[1] == "" {
+		return 0, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		// Be tolerant of JWTs that use padded base64url encoding.
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+	}
+	if err != nil {
+		return 0, false
+	}
+	var claims struct {
+		Exp json.RawMessage `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return 0, false
+	}
+	raw := strings.TrimSpace(string(claims.Exp))
+	if raw == "" || raw == "null" {
+		return 0, false
+	}
+	if value, err := strconv.ParseInt(raw, 10, 64); err == nil && value > 0 {
+		return value, true
+	}
+	// A few issuers serialize NumericDate as a quoted integer. Accept that
+	// representation while rejecting arbitrary text.
+	var quoted string
+	if json.Unmarshal(claims.Exp, &quoted) == nil {
+		if value, err := strconv.ParseInt(strings.TrimSpace(quoted), 10, 64); err == nil && value > 0 {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+// ResolveTokenExpiresAt prefers the access token's exp claim and falls back
+// to the OAuth-style expiresIn response field. A missing/non-positive
+// expiresIn is represented as zero (unknown) so callers can refresh
+// conservatively without displaying a fabricated current-time expiry.
+func ResolveTokenExpiresAt(accessToken string, expiresIn int64, now time.Time) int64 {
+	if expiresAt, ok := JWTExpiryUnix(accessToken); ok {
+		return expiresAt
+	}
+	if expiresIn <= 0 {
+		return 0
+	}
+	return now.Add(time.Duration(expiresIn) * time.Second).Unix()
 }
 
 func (a Account) Region() string {
@@ -162,34 +221,41 @@ func NewState() State {
 }
 
 type PublicAccount struct {
-	ID               string         `json:"id"`
-	UID              string         `json:"uid"`
-	Nickname         string         `json:"nickname,omitempty"`
-	Alias            string         `json:"alias,omitempty"`
-	DisplayName      string         `json:"displayName"`
-	Region           string         `json:"region"`
-	Version          string         `json:"version,omitempty"`
-	Enabled          bool           `json:"enabled"`
-	Status           string         `json:"status"`
-	LastError        string         `json:"lastError,omitempty"`
-	LastCheckinAt    time.Time      `json:"lastCheckinAt,omitempty"`
-	LastCheckinDate  string         `json:"lastCheckinDate,omitempty"`
-	LastCheckin      string         `json:"lastCheckin,omitempty"`
-	LastCheckinMsg   string         `json:"lastCheckinMessage,omitempty"`
-	LastActiveAt     time.Time      `json:"lastActiveAt,omitempty"`
-	LastActiveDate   string         `json:"lastActiveDate,omitempty"`
-	LastActive       string         `json:"lastActive,omitempty"`
-	LastActiveMsg    string         `json:"lastActiveMessage,omitempty"`
-	PendingRecheckAt time.Time      `json:"pendingRecheckAt,omitempty"`
-	RecheckAttempts  int            `json:"recheckAttempts,omitempty"`
-	LastPointsAt     time.Time      `json:"lastPointsAt,omitempty"`
-	Balance          int64          `json:"balance"`
-	Used             int64          `json:"used"`
-	Total            int64          `json:"total"`
-	Packages         []PointPackage `json:"packages,omitempty"`
+	ID               string    `json:"id"`
+	UID              string    `json:"uid"`
+	Nickname         string    `json:"nickname,omitempty"`
+	Alias            string    `json:"alias,omitempty"`
+	DisplayName      string    `json:"displayName"`
+	Region           string    `json:"region"`
+	Version          string    `json:"version,omitempty"`
+	Enabled          bool      `json:"enabled"`
+	Status           string    `json:"status"`
+	LastError        string    `json:"lastError,omitempty"`
+	LastCheckinAt    time.Time `json:"lastCheckinAt,omitempty"`
+	LastCheckinDate  string    `json:"lastCheckinDate,omitempty"`
+	LastCheckin      string    `json:"lastCheckin,omitempty"`
+	LastCheckinMsg   string    `json:"lastCheckinMessage,omitempty"`
+	LastActiveAt     time.Time `json:"lastActiveAt,omitempty"`
+	LastActiveDate   string    `json:"lastActiveDate,omitempty"`
+	LastActive       string    `json:"lastActive,omitempty"`
+	LastActiveMsg    string    `json:"lastActiveMessage,omitempty"`
+	PendingRecheckAt time.Time `json:"pendingRecheckAt,omitempty"`
+	RecheckAttempts  int       `json:"recheckAttempts,omitempty"`
+	LastPointsAt     time.Time `json:"lastPointsAt,omitempty"`
+	// TokenExpiresAt contains only the access token expiration timestamp; the
+	// credential itself is intentionally never part of PublicAccount.
+	TokenExpiresAt int64          `json:"tokenExpiresAt,omitempty"`
+	Balance        int64          `json:"balance"`
+	Used           int64          `json:"used"`
+	Total          int64          `json:"total"`
+	Packages       []PointPackage `json:"packages,omitempty"`
 }
 
 func (a Account) Public() PublicAccount {
+	tokenExpiresAt := a.ExpiresAt
+	if expiresAt, ok := JWTExpiryUnix(a.AccessToken); ok {
+		tokenExpiresAt = expiresAt
+	}
 	return PublicAccount{
 		ID:               a.ID,
 		UID:              a.UID,
@@ -212,6 +278,7 @@ func (a Account) Public() PublicAccount {
 		PendingRecheckAt: a.PendingRecheckAt,
 		RecheckAttempts:  a.RecheckAttempts,
 		LastPointsAt:     a.LastPointsAt,
+		TokenExpiresAt:   tokenExpiresAt,
 		Balance:          a.Balance,
 		Used:             a.Used,
 		Total:            a.Total,

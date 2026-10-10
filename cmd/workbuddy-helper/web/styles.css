@@ -663,6 +663,34 @@ select:disabled {
   font-size: 11px;
 }
 
+.token-expiry {
+  display: block;
+  max-width: 100%;
+  margin-top: 3px;
+  overflow: hidden;
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.token-expiry-ok {
+  color: var(--green);
+}
+
+.token-expiry-warning {
+  color: var(--amber);
+}
+
+.token-expiry-expired {
+  color: var(--red);
+  font-weight: 650;
+}
+
+.token-expiry-unknown {
+  color: var(--text-faint);
+}
+
 .status-badge,
 .checkin-label {
   display: inline-flex;

@@ -484,7 +484,7 @@ func (s *Service) commitLoginResult(result client.LoginResult) (model.PublicAcco
 				a.Version = resultVersion
 				a.AccessToken = result.AccessToken
 				a.RefreshToken = result.RefreshToken
-				a.ExpiresAt = now.Add(time.Duration(result.ExpiresIn) * time.Second).Unix()
+				a.ExpiresAt = model.ResolveTokenExpiresAt(result.AccessToken, result.ExpiresIn, now)
 				a.Enabled = true
 				a.Status = "ready"
 				a.LastError = ""
@@ -518,7 +518,7 @@ func (s *Service) commitLoginResult(result client.LoginResult) (model.PublicAcco
 			Version:      resultVersion,
 			AccessToken:  result.AccessToken,
 			RefreshToken: result.RefreshToken,
-			ExpiresAt:    now.Add(time.Duration(result.ExpiresIn) * time.Second).Unix(),
+			ExpiresAt:    model.ResolveTokenExpiresAt(result.AccessToken, result.ExpiresIn, now),
 			Enabled:      true,
 			Status:       "ready",
 			CreatedAt:    now,

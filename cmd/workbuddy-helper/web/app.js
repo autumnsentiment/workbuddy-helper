@@ -98,6 +98,7 @@
     settingsRevision: 0,
     stateLoadGeneration: 0,
     stateLoads: 0,
+    tokenExpiryTimer: null,
   };
 
   const numberFormatter = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
@@ -114,6 +115,15 @@
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Shanghai",
+  });
+  const tokenExpiryFormatter = new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
     hour12: false,
     timeZone: "Asia/Shanghai",
   });
@@ -206,6 +216,25 @@
     return null;
   }
 
+  // API 持久化 Unix 秒；同时兼容旧客户端可能返回的毫秒或 ISO 时间。
+  function normalizeTimestamp(value) {
+    if (value instanceof Date) {
+      const timestamp = value.getTime();
+      return Number.isFinite(timestamp) ? timestamp : null;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.abs(value) < 1e12 ? value * 1000 : value;
+    }
+    if (typeof value !== "string" || !value.trim()) return null;
+    const text = value.trim();
+    if (/^-?\d+(?:\.\d+)?$/.test(text)) {
+      const numeric = Number(text);
+      if (Number.isFinite(numeric)) return Math.abs(numeric) < 1e12 ? numeric * 1000 : numeric;
+    }
+    const parsed = Date.parse(text);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
   function normalizeTime(value) {
     if (typeof value !== "string") return "09:15";
     const match = value.match(/^(\d{1,2}):(\d{2})/);
@@ -253,6 +282,15 @@
     );
     const healthRaw = String(firstDefined(raw?.status, raw?.health, raw?.tokenStatus, "")).toLowerCase();
     const reason = String(firstDefined(raw?.reason, raw?.lastError, raw?.error, raw?.message, raw?.statusMessage, ""));
+    const tokenExpiresAt = normalizeTimestamp(
+      firstDefined(
+        raw?.tokenExpiresAt,
+        // 兼容早期候选接口字段；正式接口使用 tokenExpiresAt。
+        raw?.accessTokenExpiresAt,
+        raw?.expiresAt,
+        raw?.jwtExpiresAt,
+      ),
+    );
 
     const rawDomain = String(raw?.domain || "").trim().toLowerCase();
     const inferredVersion = raw?.region === "global" || rawDomain === "workbuddy.ai" || rawDomain.endsWith(".workbuddy.ai")
@@ -272,6 +310,7 @@
       checkedFlag: checkedFlag === undefined ? inferCheckedToday(raw, checkinRaw) : checkedFlag,
       healthRaw,
       reason,
+      tokenExpiresAt,
       updatedAt: firstDefined(
         raw?.pointsUpdatedAt,
         raw?.creditUpdatedAt,
@@ -469,6 +508,57 @@
     return `${dateTimeFormatter.format(date)} 更新`;
   }
 
+  function formatTokenDuration(milliseconds) {
+    let seconds = Math.max(1, Math.ceil(milliseconds / 1000));
+    const days = Math.floor(seconds / 86400);
+    seconds %= 86400;
+    const hours = Math.floor(seconds / 3600);
+    seconds %= 3600;
+    const minutes = Math.floor(seconds / 60);
+    seconds %= 60;
+    if (days > 0) return `${days}天${hours ? ` ${hours}小时` : ""}`;
+    if (hours > 0) return `${hours}小时${minutes ? ` ${minutes}分` : ""}`;
+    if (minutes > 0) return `${minutes}分`;
+    return `${seconds}秒`;
+  }
+
+  function formatTokenExpiry(account, now = Date.now()) {
+    const timestamp = Number(account.tokenExpiresAt);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) {
+      return {
+        label: "JWT 有效期未知",
+        title: "服务端未提供 JWT 令牌到期时间",
+        className: "token-expiry-unknown",
+      };
+    }
+
+    const expiry = new Date(timestamp);
+    if (Number.isNaN(expiry.getTime())) {
+      return {
+        label: "JWT 有效期未知",
+        title: "JWT 令牌到期时间格式无效",
+        className: "token-expiry-unknown",
+      };
+    }
+
+    const remaining = timestamp - now;
+    const exact = tokenExpiryFormatter.format(expiry);
+    if (remaining <= 0) {
+      return {
+        label: "JWT 已过期",
+        title: `JWT 已于 ${exact} 过期`,
+        className: "token-expiry-expired",
+      };
+    }
+
+    const duration = formatTokenDuration(remaining);
+    return {
+      label: `JWT 剩余 ${duration}`,
+      title: `JWT 有效至 ${exact}（剩余 ${duration}）`,
+      className: remaining <= 24 * 60 * 60 * 1000 ? "token-expiry-warning" : "token-expiry-ok",
+    };
+  }
+
   function renderSummary() {
     const intl = app.viewVersion === "intl";
     const enabled = app.accounts.filter((account) => account.enabled).length;
@@ -556,6 +646,7 @@
         const busy = app.busyAccounts.has(account.id);
         const name = accountDisplayName(account);
         const detail = account.nickname && account.identity !== account.nickname ? account.identity : `ID: ${account.id}`;
+        const tokenExpiry = formatTokenExpiry(account);
         const reasonTooltip = account.reason ? ` data-tooltip="${escapeHTML(account.reason)}"` : "";
         const recheckMeta = formatRecheckMeta(account);
         const pointsMeta = recheckMeta || formatUpdatedAt(account.updatedAt);
@@ -570,6 +661,7 @@
                 <span class="account-identity">
                   <span class="account-name" title="${escapeHTML(name)}">${escapeHTML(name)}</span>
                   <span class="account-detail" title="${escapeHTML(detail)}">${escapeHTML(detail)}</span>
+                  <span class="token-expiry ${tokenExpiry.className}" title="${escapeHTML(tokenExpiry.title)}">${escapeHTML(tokenExpiry.label)}</span>
                 </span>
               </div>
             </td>
@@ -674,6 +766,20 @@
     renderSummary();
     renderAccounts();
     renderSchedule();
+  }
+
+  function refreshTokenExpiry() {
+    if (app.isLoading) return;
+    elements.accountRows.querySelectorAll("[data-account-id]").forEach((row) => {
+      const account = getAccountById(row.dataset.accountId);
+      if (!account || !Number.isFinite(account.tokenExpiresAt)) return;
+      const node = row.querySelector(".token-expiry");
+      if (!node) return;
+      const tokenExpiry = formatTokenExpiry(account);
+      node.className = `token-expiry ${tokenExpiry.className}`;
+      node.title = tokenExpiry.title;
+      node.textContent = tokenExpiry.label;
+    });
   }
 
   function setConnection(status, label) {
@@ -1307,5 +1413,7 @@
 
   bindEvents();
   refreshIcons();
+  // 令牌有效期在服务端不会主动推送，定期刷新文案即可保持剩余时间准确。
+  app.tokenExpiryTimer = window.setInterval(refreshTokenExpiry, 15000);
   loadState();
 })();

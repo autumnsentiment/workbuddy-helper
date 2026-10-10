@@ -42,6 +42,54 @@ func TestStateDoesNotExposeTokens(t *testing.T) {
 	}
 }
 
+func TestStateExposesTokenExpiryWithoutCredentials(t *testing.T) {
+	const expiry int64 = 1893456000
+	st := store.New(t.TempDir())
+	state := model.NewState()
+	state.Accounts = []model.Account{{
+		ID:           "expiry-account",
+		UID:          "u-expiry",
+		AccessToken:  "access-secret",
+		RefreshToken: "refresh-secret",
+		ExpiresAt:    expiry,
+		Enabled:      true,
+		Status:       "ready",
+	}}
+	if err := st.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := service.New(st, client.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New(svc, fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("<html><head></head></html>")},
+	}, "", nil).Handler()
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/state", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("state status=%d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "accessToken") || strings.Contains(w.Body.String(), "refreshToken") {
+		t.Fatalf("state response exposed credentials: %s", w.Body.String())
+	}
+	var response struct {
+		CN []struct {
+			TokenExpiresAt int64 `json:"tokenExpiresAt"`
+		} `json:"cnAccounts"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.CN) != 1 {
+		t.Fatalf("expected one domestic account, got %+v", response.CN)
+	}
+	if response.CN[0].TokenExpiresAt != expiry {
+		t.Fatalf("token expiry=%d, want %d; body=%s", response.CN[0].TokenExpiresAt, expiry, w.Body.String())
+	}
+}
+
 func TestWriteRequiresAppToken(t *testing.T) {
 	svc, handler := testServer(t)
 	r := httptest.NewRequest(http.MethodPost, "/api/run-all", strings.NewReader("{}"))
