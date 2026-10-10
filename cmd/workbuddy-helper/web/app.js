@@ -1413,7 +1413,7 @@
 
   bindEvents();
   refreshIcons();
-  // 令牌有效期在服务端不会主动推送，定期刷新文案即可保持剩余时间准确。
-  app.tokenExpiryTimer = window.setInterval(refreshTokenExpiry, 15000);
+  // 令牌有效期在服务端不会主动推送；页面首次渲染后按小时更新剩余时间文案。
+  app.tokenExpiryTimer = window.setInterval(refreshTokenExpiry, 60 * 60 * 1000);
   loadState();
 })();
