@@ -333,6 +333,18 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	if !strings.Contains(reportBody, "chat_request_send") || !strings.Contains(reportBody, convIDSeen) {
 		t.Fatalf("report body missing event: %s", reportBody)
 	}
+	// /v2/report 需要扁平事件数组（eventCode 在顶层）；嵌套 {code,event}
+	// 会被服务端判为 "eventCode is empty or not string"。
+	var reportEvents []map[string]any
+	if err := json.Unmarshal([]byte(reportBody), &reportEvents); err != nil {
+		t.Fatalf("report body is not a JSON array: %v body=%s", err, reportBody)
+	}
+	if len(reportEvents) != 1 {
+		t.Fatalf("report should carry exactly one event, got %d", len(reportEvents))
+	}
+	if code, _ := reportEvents[0]["eventCode"].(string); code != "chat_request_send" {
+		t.Fatalf("eventCode must be a top-level string, got %#v", reportEvents[0]["eventCode"])
+	}
 	if gotUA != IntlClientUA {
 		t.Fatalf("活跃请求必须带 WorkBuddy 桌面端 UA，got=%q", gotUA)
 	}

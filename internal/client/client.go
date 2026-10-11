@@ -1388,17 +1388,29 @@ func (c *Client) reportChatEvent(a *model.Account, prompt, modelName, convID, re
 		"agentName":             "craft",
 		"agentType":             "default",
 	}
-	body, _ := json.Marshal([]map[string]any{{"code": "chat_request_send", "event": event}})
+	// 请求体结构对齐 CLI StandardEventService：事件对象数组，eventCode 在顶层
+	// （report() 里 `{eventCode, timestamp, reportDelay, ...payload}` 直接入批），
+	// 而不是 {code, event} 嵌套；嵌套会被服务端判为 "eventCode is empty or not string"。
+	body, _ := json.Marshal([]map[string]any{event})
 	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/v2/report", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	// 标准事件服务头（对齐 CLI StandardEventService：仅 Authorization + Content-Type，
-	// 产品配置未下发自定义 report headers）
+	// 标准事件服务头：对齐桌面端 createDesktopHostReportHeadersProvider
+	// （X-Request-ID / X-Product / User-Agent + 鉴权头），仅 Content-Type +
+	// Authorization 会被服务端按非客户端来源处理。
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("X-Request-ID", strings.ReplaceAll(newUUID(), "-", ""))
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("User-Agent", IntlClientUA)
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
+	}
+	if a.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
 	if a.Domain != "" {
 		req.Header.Set("X-Domain", a.Domain)
