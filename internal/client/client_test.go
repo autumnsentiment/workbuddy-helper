@@ -348,6 +348,17 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	if !strings.Contains(gotBody, `"stream":true`) || !strings.Contains(gotBody, `"model":"hy4-preview"`) {
 		t.Fatalf("body=%s", gotBody)
 	}
+	// hy3/hy4-preview 是 onlyReasoning 纯推理模型：推理内容同样占用输出预算，
+	// 预算过小会让 content 为空。必须与真实客户端同量级地下发 max_tokens。
+	var sentBody struct {
+		MaxTokens int `json:"max_tokens"`
+	}
+	if err := json.Unmarshal([]byte(gotBody), &sentBody); err != nil {
+		t.Fatalf("请求体不是有效 JSON: %v", err)
+	}
+	if sentBody.MaxTokens < 2048 {
+		t.Fatalf("max_tokens=%d 过小，推理模型会因推理耗尽预算而返回空 content", sentBody.MaxTokens)
+	}
 	if !strings.Contains(gotBody, DefaultActivePrompt) {
 		t.Fatalf("默认提示词缺失: %s", gotBody)
 	}
@@ -363,6 +374,47 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, "自定义测试提问") || strings.Contains(gotBody, DefaultActivePrompt) {
 		t.Fatalf("自定义提示词未生效: %s", gotBody)
+	}
+}
+
+func TestActiveChatAcceptsReasoningOnlyStream(t *testing.T) {
+	// hy3 等 onlyReasoning 模型的流式回答可能只带 reasoning_content
+	// （推理尚未产出正式 content 即被判定为有效会话）。
+	for _, body := range []string{
+		"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
+		"data: {\"choices\":[{\"delta\":{\"reasoning\":\"thinking\"}}]}\n\n",
+		"data: {\"choices\":[{\"message\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
+		// 整段 JSON（非 SSE）与 typed block 数组形式的 content
+		"{\"choices\":[{\"message\":{\"content\":\"hello\"}}]}",
+		"data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}]}\n\n",
+	} {
+		c := testClient(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/v2/report" {
+				return response(200, `{"code":0}`), nil
+			}
+			return response(http.StatusOK, body), nil
+		})
+		err := c.ActiveChat(&model.Account{AccessToken: "at", Version: model.ModeIntl}, "hy3", "")
+		if err != nil {
+			t.Fatalf("推理内容应被认定为有效回答: body=%q err=%v", body, err)
+		}
+	}
+}
+
+func TestActiveChatEmptyStreamReportsResponseSnippet(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/v2/report" {
+			return response(200, `{"code":0}`), nil
+		}
+		return response(http.StatusOK, "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}],\"note\":\"upstream-empty\"}\n\n"), nil
+	})
+	err := c.ActiveChat(&model.Account{AccessToken: "at", Version: model.ModeIntl}, "hy3", "")
+	if err == nil || !IsKind(err, KindProtocol) {
+		t.Fatalf("空回答应判定为协议错误: %v", err)
+	}
+	// 失败信息需带响应片段，便于线上定位上游真实返回结构。
+	if !strings.Contains(err.Error(), "upstream-empty") {
+		t.Fatalf("错误信息缺少响应片段: %v", err)
 	}
 }
 

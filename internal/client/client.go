@@ -1083,11 +1083,12 @@ func (c *Client) ActiveChatWithResult(a *model.Account, modelName, prompt string
 	if prompt == "" {
 		prompt = DefaultActivePrompt
 	}
-	// max_tokens 按提示词长度放宽：保证模型能完整作答，会话被判有效
-	maxTokens := 64
-	if r := []rune(prompt); len(r) > 40 {
-		maxTokens = 160
-	}
+	// max_tokens：hy3 / hy4-preview 在国际版 product.json 中均为 onlyReasoning
+	// 纯推理模型（onlyReasoning=true、reasoning.effort=high），推理内容
+	// （delta.reasoning_content）同样占用输出预算。真实客户端按模型
+	// maxOutputTokens（hy3=64000）下发；预算过小会让推理先耗尽额度、
+	// 正式回答 content 为空，从而被误判为“未返回有效回答”。
+	maxTokens := 4096
 	// 会话 ID：客户端本地生成（用于 growthEvent.id 与请求头，服务端据此登记活跃）
 	convID := newUUID()
 	reqID := strings.ReplaceAll(newUUID(), "-", "")
@@ -1187,6 +1188,8 @@ func validateActiveChatResponse(raw []byte) error {
 	var sawAnswer bool
 	var eventName string
 	var dataLines []string
+	// snippet 记录最后一段业务负载，仅在判定失败时用于定位上游实际返回内容。
+	var snippet string
 	checkEvent := func() error {
 		if len(dataLines) == 0 {
 			eventName = ""
@@ -1199,16 +1202,23 @@ func validateActiveChatResponse(raw []byte) error {
 		if data == "[DONE]" {
 			return nil
 		}
+		if snippet == "" {
+			snippet = short(data, 160)
+		}
 		var packet struct {
 			Code    int             `json:"code"`
 			Msg     string          `json:"msg"`
 			Error   json.RawMessage `json:"error"`
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					Reasoning        string          `json:"reasoning"`
 				} `json:"delta"`
 				Message struct {
-					Content string `json:"content"`
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					Reasoning        string          `json:"reasoning"`
 				} `json:"message"`
 				Text string `json:"text"`
 			} `json:"choices"`
@@ -1241,33 +1251,80 @@ func validateActiveChatResponse(raw []byte) error {
 			return &Error{Kind: KindBusiness, Msg: short(data, 180)}
 		}
 		for _, choice := range packet.Choices {
-			if strings.TrimSpace(choice.Delta.Content) != "" ||
-				strings.TrimSpace(choice.Message.Content) != "" ||
+			if strings.TrimSpace(chatContentText(choice.Delta.Content)) != "" ||
+				strings.TrimSpace(choice.Delta.ReasoningContent) != "" ||
+				strings.TrimSpace(choice.Delta.Reasoning) != "" ||
+				strings.TrimSpace(chatContentText(choice.Message.Content)) != "" ||
+				strings.TrimSpace(choice.Message.ReasoningContent) != "" ||
+				strings.TrimSpace(choice.Message.Reasoning) != "" ||
 				strings.TrimSpace(choice.Text) != "" {
 				sawAnswer = true
 			}
 		}
 		return nil
 	}
-	for _, line := range strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n") {
-		switch {
-		case line == "":
-			if err := checkEvent(); err != nil {
-				return err
+	body := strings.ReplaceAll(string(raw), "\r\n", "\n")
+	hasSSE := false
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "data:") || strings.HasPrefix(line, "event:") {
+			hasSSE = true
+			break
+		}
+	}
+	// 部分部署（代理或自建网关）直接返回整段 JSON，而不是 SSE 事件流。
+	if !hasSSE {
+		if trimmed := strings.TrimSpace(body); trimmed != "" && trimmed != "[DONE]" {
+			dataLines = append(dataLines, trimmed)
+		}
+	} else {
+		for _, line := range strings.Split(body, "\n") {
+			switch {
+			case line == "":
+				if err := checkEvent(); err != nil {
+					return err
+				}
+			case strings.HasPrefix(line, "event:"):
+				eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			case strings.HasPrefix(line, "data:"):
+				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 			}
-		case strings.HasPrefix(line, "event:"):
-			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		case strings.HasPrefix(line, "data:"):
-			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
 		}
 	}
 	if err := checkEvent(); err != nil {
 		return err
 	}
 	if !sawAnswer {
-		return &Error{Kind: KindProtocol, Msg: "对话未返回有效回答，不能确认活跃"}
+		msg := "对话未返回有效回答，不能确认活跃"
+		if snippet != "" {
+			msg += "（响应片段：" + snippet + "）"
+		}
+		return &Error{Kind: KindProtocol, Msg: msg}
 	}
 	return nil
+}
+
+// chatContentText flattens a chat content value, which may be a plain string or
+// an array of typed blocks ({"type":"text","text":"..."}) as used by the
+// client-side message format.
+func chatContentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var blocks []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		var sb strings.Builder
+		for _, block := range blocks {
+			sb.WriteString(block.Text)
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 // reportChatEvent 复刻 CLI StandardEventService：上报 chat_request_send 事件
