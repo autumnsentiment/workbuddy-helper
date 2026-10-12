@@ -300,13 +300,19 @@ func TestRefreshUsesJWTExpiryClaim(t *testing.T) {
 func TestActiveChatSendsClientConversation(t *testing.T) {
 	var gotPath, gotUA, gotProduct, gotAuth, gotUID, gotBody, gotIDEType string
 	var paths []string
-	var reportBody, convIDSeen string
+	var reportBody, convIDSeen, createBody, createConvID string
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		paths = append(paths, r.URL.Path)
 		if r.URL.Path == "/v2/report" {
 			raw, _ := io.ReadAll(r.Body)
 			reportBody = string(raw)
 			return response(200, `{"code":0}`), nil
+		}
+		if r.URL.Path == "/console/as/conversations/v2" {
+			raw, _ := io.ReadAll(r.Body)
+			createBody = string(raw)
+			createConvID = r.Header.Get("X-Conversation-ID")
+			return response(200, `{"code":0,"data":{"id":"server-conv-1","sessionId":"server-conv-1"}}`), nil
 		}
 		gotIDEType = r.Header.Get("X-IDE-Type")
 		convIDSeen = r.Header.Get("X-Conversation-ID")
@@ -326,9 +332,29 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	if gotPath != "/v2/chat/completions" {
 		t.Fatalf("path=%s", gotPath)
 	}
-	// 活跃闭环：chat 之后必须上报 chat_request_send 遥测事件
-	if len(paths) != 2 || paths[1] != "/v2/report" {
-		t.Fatalf("expected chat then report, got paths=%v", paths)
+	// 活跃闭环：先登记云端会话，再发对话，最后补遥测（对齐真实客户端）。
+	if len(paths) != 3 || paths[0] != "/console/as/conversations/v2" || paths[1] != "/v2/chat/completions" || paths[2] != "/v2/report" {
+		t.Fatalf("expected create->chat->report, got paths=%v", paths)
+	}
+	// 会话登记请求体必须带本地 sessionId（服务端据此登记新会话）
+	var createPayload struct {
+		Type      string `json:"type"`
+		SessionID string `json:"sessionId"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal([]byte(createBody), &createPayload); err != nil {
+		t.Fatalf("会话登记请求体不是有效 JSON: %v body=%s", err, createBody)
+	}
+	if createPayload.Type != "local" || createPayload.SessionID == "" || createPayload.Name == "" {
+		t.Fatalf("会话登记请求体不完整: %s", createBody)
+	}
+	// 会话登记请求不应携带会话维度头（会话尚未创建）
+	if createConvID != "" {
+		t.Fatalf("会话登记请求不应带 X-Conversation-ID: %q", createConvID)
+	}
+	// 对话请求使用服务端返回的会话 ID
+	if convIDSeen != "server-conv-1" {
+		t.Fatalf("对话请求应使用服务端会话 ID，got=%q", convIDSeen)
 	}
 	if !strings.Contains(reportBody, "chat_request_send") || !strings.Contains(reportBody, convIDSeen) {
 		t.Fatalf("report body missing event: %s", reportBody)
@@ -386,6 +412,72 @@ func TestActiveChatSendsClientConversation(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, "自定义测试提问") || strings.Contains(gotBody, DefaultActivePrompt) {
 		t.Fatalf("自定义提示词未生效: %s", gotBody)
+	}
+}
+
+func TestActiveChatCreatesFreshConversationEachTime(t *testing.T) {
+	// 每次活跃都必须在云端新开一个会话，绝不复用上一次的会话 ID。
+	var sessionIDs []string
+	var convIDs []string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/console/as/conversations/v2":
+			raw, _ := io.ReadAll(r.Body)
+			var payload struct {
+				SessionID string `json:"sessionId"`
+			}
+			_ = json.Unmarshal(raw, &payload)
+			sessionIDs = append(sessionIDs, payload.SessionID)
+			// 服务端为每个本地会话分配独立 ID
+			serverID := "server-" + payload.SessionID
+			return response(200, `{"code":0,"data":{"id":"`+serverID+`","sessionId":"`+serverID+`"}}`), nil
+		case "/v2/report":
+			return response(200, `{"code":0}`), nil
+		default:
+			convIDs = append(convIDs, r.Header.Get("X-Conversation-ID"))
+			return response(200, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"), nil
+		}
+	})
+	account := &model.Account{AccessToken: "at", UID: "u1", Domain: "workbuddy.ai"}
+	for i := 0; i < 2; i++ {
+		if err := c.ActiveChat(account, "hy3", ""); err != nil {
+			t.Fatalf("第 %d 次活跃失败: %v", i+1, err)
+		}
+	}
+	if len(sessionIDs) != 2 || len(convIDs) != 2 {
+		t.Fatalf("expected 2 create+chat rounds, sessions=%v convs=%v", sessionIDs, convIDs)
+	}
+	if sessionIDs[0] == sessionIDs[1] {
+		t.Fatalf("两次活跃复用了同一本地会话: %v", sessionIDs)
+	}
+	if convIDs[0] == convIDs[1] {
+		t.Fatalf("两次活跃复用了同一服务端会话: %v", convIDs)
+	}
+}
+
+func TestActiveChatConversationFailureStillChats(t *testing.T) {
+	// 会话登记失败（例如接口不可用）不应阻断对话，但必须回传警告。
+	var chatCalled bool
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/console/as/conversations/v2":
+			return response(http.StatusServiceUnavailable, `{"code":10001,"msg":"unavailable"}`), nil
+		case "/v2/report":
+			return response(200, `{"code":0}`), nil
+		default:
+			chatCalled = true
+			return response(200, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"), nil
+		}
+	})
+	result, err := c.ActiveChatWithResult(&model.Account{AccessToken: "at", UID: "u1", Domain: "workbuddy.ai"}, "hy3", "")
+	if err != nil {
+		t.Fatalf("会话登记失败不应阻断对话: %v", err)
+	}
+	if !chatCalled {
+		t.Fatal("会话登记失败后未继续发送对话")
+	}
+	if result.ConversationWarning == nil {
+		t.Fatal("会话登记失败必须回传警告")
 	}
 }
 

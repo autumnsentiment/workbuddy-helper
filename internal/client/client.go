@@ -1068,6 +1068,106 @@ const DefaultActivePrompt = "你是谁，谁开发你的，现在是什么时间
 // 自定义更自然的多句提问可提高会话有效性；prompt 留空使用 DefaultActivePrompt。
 type ActiveChatResult struct {
 	ReportWarning error
+	// ConversationWarning 记录云端会话创建失败（会话登记失败不影响对话本身，
+	// 但真实客户端一定会先登记会话，缺失时活跃可能不被认定）。
+	ConversationWarning error
+}
+
+// ConversationInfo 是云端会话登记结果（对齐桌面端 EdgeSync syncCreateConversation）。
+type ConversationInfo struct {
+	// ConversationID 服务端会话 ID；登记成功后用作对话请求的 X-Conversation-ID。
+	ConversationID string
+	// SessionID 服务端回传的会话标识（部分部署与 ConversationID 相同）。
+	SessionID string
+}
+
+// CreateConversation 复刻桌面端 EdgeSync 的 syncCreateConversation：
+// POST /console/as/conversations/v2 在云端登记一个本地会话。
+//
+// 真实客户端的活跃链路是「会话登记 → 对话 → 活跃」，会话登记让服务端确认
+// 该账号正以桌面客户端身份在本地新开会话；缺少这一步时，服务端可能不把
+// 随后的对话计为有效活跃会话。每次活跃都应新开一个会话（sessionID 每次不同）。
+func (c *Client) CreateConversation(a *model.Account, sessionID, title, modelName string) (ConversationInfo, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ConversationInfo{}, &Error{Kind: KindProtocol, Msg: "会话 ID 不能为空"}
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		// 对齐 EdgeSync resolveTitleForSync 的默认标题
+		title = "新任务"
+	}
+	now := time.Now().UnixMilli()
+	body, _ := json.Marshal(map[string]any{
+		"type":               "local",
+		"sessionId":          sessionID,
+		"name":               title,
+		"conversationOrigin": "legacy_workbuddy_local",
+		"workDir":            "",
+		// 无工作目录的本地会话在真实客户端记为 playground
+		"isPlayground":     1,
+		"createdAtMs":      now,
+		"updatedAtMs":      now,
+		"lastActivityAtMs": now,
+		"clientContext": map[string]any{
+			"localStatus":    "active",
+			"hostId":         machineID(),
+			"sessionKind":    "manual",
+			"model":          modelName,
+			"sourceMode":     "",
+			"permissionMode": "",
+			"expert": map[string]any{
+				"id":              "",
+				"locale":          "",
+				"runtimeIdentity": "",
+				"marketplace":     "",
+			},
+		},
+	})
+	req, err := http.NewRequest(http.MethodPost, c.base(a, false)+"/console/as/conversations/v2", bytes.NewReader(body))
+	if err != nil {
+		return ConversationInfo{}, err
+	}
+	conversationHeaders(req, a)
+	data, _, err := c.doEnvelope(req)
+	if err != nil {
+		return ConversationInfo{}, err
+	}
+	var result struct {
+		ID        string `json:"id"`
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return ConversationInfo{}, &Error{Kind: KindProtocol, Msg: "会话登记响应格式发生变化"}
+	}
+	return ConversationInfo{ConversationID: result.ID, SessionID: result.SessionID}, nil
+}
+
+// conversationHeaders 会话登记请求头：与对话请求共用客户端身份特征，
+// 但不带会话维度头（会话尚未创建）。
+func conversationHeaders(req *http.Request, a *model.Account) {
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", ClientUA)
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	if a.UID != "" {
+		req.Header.Set("X-User-Id", a.UID)
+	}
+	if a.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+	}
+	if a.Domain != "" {
+		req.Header.Set("X-Domain", a.Domain)
+	}
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Request-ID", strings.ReplaceAll(newUUID(), "-", ""))
+	if isGlobalAccount(a) {
+		req.Header.Set("User-Agent", IntlClientUA)
+		req.Header.Set("X-IDE-Type", IntlClientName)
+		req.Header.Set("X-IDE-Name", IntlClientName)
+		req.Header.Set("X-IDE-Version", IntlClientVer)
+	}
 }
 
 func (c *Client) ActiveChat(a *model.Account, modelName, prompt string) error {
@@ -1089,15 +1189,31 @@ func (c *Client) ActiveChatWithResult(a *model.Account, modelName, prompt string
 	// maxOutputTokens（hy3=64000）下发；预算过小会让推理先耗尽额度、
 	// 正式回答 content 为空，从而被误判为“未返回有效回答”。
 	maxTokens := 4096
-	// 会话 ID：客户端本地生成（用于 growthEvent.id 与请求头，服务端据此登记活跃）
-	convID := newUUID()
+	// 会话 ID：客户端本地生成（用于 growthEvent.id 与请求头，服务端据此登记活跃）。
+	// 每次活跃都新开一个会话：sessionID 每次调用都不同，绝不复用历史会话。
+	sessionID := newUUID()
+	convID := sessionID
 	reqID := strings.ReplaceAll(newUUID(), "-", "")
+	// 会话登记：对齐真实客户端 EdgeSync，先 POST /console/as/conversations/v2
+	// 让服务端确认账号正以桌面客户端身份在本地新开会话，再发对话。
+	// 登记失败不阻断对话（尽力而为），但会作为警告回传给上层日志。
+	var conversationWarning error
+	if isGlobalAccount(a) {
+		info, err := c.CreateConversation(a, sessionID, "", modelName)
+		if err != nil {
+			conversationWarning = err
+		} else if info.ConversationID != "" {
+			// 服务端会话 ID 与本地 sessionID 映射：对话请求使用服务端 ID，
+			// growthEvent.id 仍用本地 sessionID（与真实客户端一致）。
+			convID = info.ConversationID
+		}
+	}
 	// growthEvent：真实客户端（WorkBuddy 桌面场景）把 chat_request_send 事件
 	// 以 JSON 字符串放在请求体 extra_vars.growthEvent 随对话一起上报——
 	// 服务端从该字段读取活跃事件（独立 /v2/report 不是桌面端路径）。
 	growthEvents := []map[string]any{{
 		"eventCode": "chat_request_send",
-		"id":        convID,
+		"id":        sessionID,
 		"extra": map[string]any{
 			"inputLength":          len([]rune(prompt)),
 			"requestModelId":       modelName,
@@ -1110,7 +1226,7 @@ func (c *Client) ActiveChatWithResult(a *model.Account, modelName, prompt string
 			"skillCount":           0,
 			"totalCount":           0,
 			"rootRequestId":        reqID,
-			"parentConversationId": convID,
+			"parentConversationId": sessionID,
 			"agentName":            "craft",
 			"agentType":            "default",
 		},
@@ -1181,7 +1297,7 @@ func (c *Client) ActiveChatWithResult(a *model.Account, modelName, prompt string
 	// 备用通道：桌面端主路径是请求体 extra_vars.growthEvent（上方已带），
 	// 这里再补一次独立遥测上报。失败应可见，但不能抹掉已成功的对话。
 	warning := c.reportChatEvent(a, prompt, modelName, convID, reqID, req.Header.Get("X-Conversation-Message-ID"))
-	return ActiveChatResult{ReportWarning: warning}, nil
+	return ActiveChatResult{ReportWarning: warning, ConversationWarning: conversationWarning}, nil
 }
 
 func validateActiveChatResponse(raw []byte) error {

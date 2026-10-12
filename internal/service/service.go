@@ -980,6 +980,11 @@ func (s *Service) ActiveChat(id string, force bool) (model.PublicAccount, error)
 	if result.ReportWarning != nil {
 		s.appendLog("warn", id, "活跃对话已返回有效回答，但备用遥测上报失败："+sanitize(result.ReportWarning.Error()))
 	}
+	if result.ConversationWarning != nil {
+		// 会话登记失败不阻断对话，但真实客户端一定会先登记会话；
+		// 缺失时活跃可能不被服务端认定，需要明确告警。
+		s.appendLog("warn", id, "云端会话登记失败（活跃可能不被认定）："+sanitize(result.ConversationWarning.Error()))
+	}
 	promptDesc := activePrompt
 	if promptDesc == "" {
 		promptDesc = client.DefaultActivePrompt
