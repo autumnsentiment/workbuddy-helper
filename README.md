@@ -10,7 +10,7 @@
 
 - [功能特性](#功能特性)
 - [界面预览](#界面预览)
-- [下载免安装版（Windows）](#下载免安装版windows)
+- [下载发布包](#下载发布包)
 - [快速开始（Windows）](#快速开始windows)
 - [Docker 部署](#docker-部署)
 - [命令行选项](#命令行选项)
@@ -36,10 +36,11 @@
   - **国际版**（workbuddy.ai）：向服务端发送对话以申请当日活跃积分；会话返回有效回答不等于积分已经到账，最终发放由服务端决定。国际账号列表的请求参照国际版客户端格式：
     - 端点 `https://www.workbuddy.ai/v2/chat/completions`（流式，system 消息必须在前，否则 400 code=11128）
     - 客户端特征头：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1` UA + `X-IDE-Type/Name: WorkBuddy` + `X-Product: SaaS` + `X-User-Id` + `X-Domain`（逆向自国际版客户端 CLIENT_INFO 注入链路，plans-usage 页识别为 WorkBuddy 客户端）
-    - 模型可选 `hy3` / `hy4-preview`；活跃请求按提示词长度使用 `max_tokens=64`，较长提示词使用 `160`，避免回答被截断
+    - 模型可选 `hy3` / `hy4-preview`；两者都是 `onlyReasoning` 纯推理模型，推理内容同样占用输出预算，活跃请求统一下发 `max_tokens=4096`（与真实客户端同量级），避免推理耗尽预算导致 `content` 为空而被误判为无效会话
     - 积分查询走 `https://www.codebuddy.ai/v2/billing/meter/get-user-resource`（实测 credits 单位）
     - 国际版账号通过「添加账户」在 WorkBuddy 登录页完成浏览器授权——授权页为 `https://www.workbuddy.ai/login?platform=workbuddy-ai&state=...`（对齐国际版客户端登录链路：state → 授权页 → token 轮询 → account，全部走 workbuddy.ai 同域）。
   - **积分延迟复核**：国际版积分非即时到账；会话发出前先校验本程序保存的服务端登录态及积分查询，收到有效对话回答后按设置延迟（默认 840 分钟=14h，可调 60-1440）自动复查积分变化，无变化最多重试 6 次；界面区分“已发送待复核”“积分已到账”和“复核未到账”。
+  - **活跃链路对齐真实客户端**：每次活跃都**新开一个云端会话**，先 `POST /console/as/conversations/v2` 登记会话（`conversationOrigin=legacy_workbuddy_local`），再以服务端返回的会话 ID 作为 `X-Conversation-ID` 发送对话，并把 `chat_request_send` 遥测事件（`extra_vars.growthEvent`）随请求一起上报——让服务端把该账号识别为「真实客户端正在活跃」，而不是在同一个旧会话上反复发送。会话登记失败不阻断对话，但会在运行日志中告警「云端会话登记失败（活跃可能不被认定）」。
 - **一键刷新积分**：位于「全部签到」左侧，立即刷新**当前版本列表**全部启用账号的积分（不触发签到/活跃）。
 - **活跃提示词自定义**：国际版设置区可自定义活跃会话的消息内容（留空使用默认「你是谁，谁开发你的，现在是什么时间，什么天气」）。过短问候（如 hi）可能被服务端判定为非有效会话；每次活跃（含定时任务）均使用当前保存的提示词；手动点击「活跃」按钮会强制重发（不受"今日已活跃"跳过限制）。
 - **网络链路双通道**：
@@ -65,13 +66,15 @@
 
 ---
 
-## 下载免安装版（Windows）
+## 下载发布包
 
-不想自己编译的话，直接到 Releases 下载单文件程序（最新已发布版本 **v1.0.6**；v1.0.7 修复已在本地完成，尚未发布）：
+不想自己编译的话，直接到 Releases 下载单文件程序（最新已发布版本 **v1.0.8**）：
 
 | 文件 | 说明 |
 |---|---|
 | [`WorkBuddyHelper-windows-amd64.exe`](https://github.com/autumnsentiment/workbuddy-helper/releases/latest) | Windows 64 位免安装单文件，双击即用，无需 Go 或任何运行库 |
+| [`WorkBuddyHelper-linux-amd64`](https://github.com/autumnsentiment/workbuddy-helper/releases/latest) | Linux 64 位静态二进制（amd64），可直接在服务器运行 |
+| [`WorkBuddyHelper-source.zip`](https://github.com/autumnsentiment/workbuddy-helper/releases/latest) | 完整源码压缩包（含 Dockerfile / docker-compose.yml，不含任何账号数据） |
 | `SHA256SUMS.txt` | 校验值，用于确认下载文件未被篡改 |
 
 ```powershell
@@ -102,7 +105,23 @@ certutil -hashfile WorkBuddyHelper-windows-amd64.exe SHA256
 
 ## Docker 部署
 
-### 1. 构建镜像
+### 1. 获取镜像
+
+**方式 A：直接拉取已构建镜像（推荐，无需本地 Go 环境）**
+
+每次打 `v*` 标签发布时，GitHub Actions 会自动构建并推送多架构镜像到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/autumnsentiment/workbuddy-helper:latest
+# 或锁定具体版本
+docker pull ghcr.io/autumnsentiment/workbuddy-helper:1.0.8
+```
+
+镜像同时包含 `linux/amd64` 与 `linux/arm64` 两个架构，Docker 会自动选择匹配当前机器的版本。
+如需使用该镜像，把 `docker-compose.yml` 中的 `build: .` 注释掉、并将 `image:` 改为
+`ghcr.io/autumnsentiment/workbuddy-helper:latest` 即可。
+
+**方式 B：本地构建镜像**
 
 在仓库根目录（含 `go.mod` / `cmd/` / `internal/`）执行：
 
@@ -362,6 +381,15 @@ A：签到与积分使用 WorkBuddy 客户端当前调用的 billing 接口；�
 ---
 
 ## 更新日志
+
+### v1.0.8（2026-10-15）
+
+- **活跃账号链路对齐真实客户端（本次核心修复）**：每次活跃都新开一个云端会话，先 `POST /console/as/conversations/v2` 登记会话，再以服务端返回的会话 ID 发送对话；会话 ID 每次不同，不再复用同一个旧会话。实测该改动后国际版活跃积分可正常到账。
+- **活跃遥测事件补齐**：`chat_request_send` 事件按桌面端格式放在请求体 `extra_vars.growthEvent` 随对话一起上报（独立 `/v2/report` 降级为备用通道），事件字段与上报头（`X-Request-ID` / `X-Product` / 客户端 UA / 企业头）对齐真实客户端。
+- **修复活跃会话被误判无效**：`hy3` / `hy4-preview` 均为 `onlyReasoning` 纯推理模型，推理内容同样占用输出预算；活跃请求 `max_tokens` 从 64/160 提升到 `4096`（与真实客户端同量级），修复推理耗尽预算导致 `content` 为空、进而被判定「未返回有效回答」的问题。校验同时接受 `reasoning_content`，并兼容整段 JSON 与 content 数组两种响应格式。
+- **显示 JWT 令牌有效期**：账号列表展示访问令牌的预计到期时间（优先读取 JWT `exp`，回退上游 `expiresIn`），并按小时自动刷新，便于提前发现登录即将失效。
+- **识别「登录处理中」状态**：上游在用户尚未完成授权时返回 HTTP 200 + `code=11217`（`login ing...`），现在会被正确识别为「等待授权」并继续轮询，不再直接报错。
+- 预检失败不再发送活跃请求；只有收到有效回答才认定会话成功；界面区分「已发送待复核」「积分已到账」「复核未到账」。
 
 ### v1.0.7（2026-09-28）
 

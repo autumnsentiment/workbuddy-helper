@@ -11,7 +11,7 @@
 
 FROM golang:1.26-alpine AS build
 WORKDIR /src
-ARG APP_VERSION=1.0.7
+ARG APP_VERSION=1.0.8
 COPY go.mod go.sum ./
 COPY cmd/ ./cmd/
 COPY internal/ ./internal/

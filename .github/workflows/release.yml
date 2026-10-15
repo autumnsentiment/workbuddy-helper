@@ -1,0 +1,185 @@
+name: Release
+
+# 打 v* 标签时构建多架构镜像并推送到 GitHub Container Registry，
+# 同时构建 Windows / Linux 单文件二进制并附加到对应 Release。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 1.0.8），仅用于镜像标签'
+        required: true
+
+permissions:
+  contents: write   # 创建/更新 Release 并上传产物
+  packages: write   # 推送镜像到 GHCR
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/workbuddy-helper
+
+jobs:
+  build-binaries:
+    name: 构建二进制并发布 Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "resolved version: $VERSION"
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Test
+        run: go test ./... -shuffle=on
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build Windows amd64
+        run: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -X main.appVersion=${{ steps.version.outputs.version }}" \
+            -o WorkBuddyHelper-windows-amd64.exe ./cmd/workbuddy-helper
+
+      - name: Build Linux amd64
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -X main.appVersion=${{ steps.version.outputs.version }}" \
+            -o WorkBuddyHelper-linux-amd64 ./cmd/workbuddy-helper
+
+      - name: Build Linux arm64
+        run: |
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+            -ldflags="-s -w -X main.appVersion=${{ steps.version.outputs.version }}" \
+            -o WorkBuddyHelper-linux-arm64 ./cmd/workbuddy-helper
+
+      - name: Package source archive
+        run: |
+          # 只打包源码本体，绝不包含 data/ 等账号数据
+          mkdir -p "WorkBuddyHelper-v${{ steps.version.outputs.version }}"
+          git archive HEAD | tar -x -C "WorkBuddyHelper-v${{ steps.version.outputs.version }}"
+          rm -rf "WorkBuddyHelper-v${{ steps.version.outputs.version }}/data"
+          zip -r WorkBuddyHelper-source.zip "WorkBuddyHelper-v${{ steps.version.outputs.version }}"
+
+      - name: Generate checksums
+        run: |
+          sha256sum WorkBuddyHelper-windows-amd64.exe \
+                    WorkBuddyHelper-linux-amd64 \
+                    WorkBuddyHelper-linux-arm64 \
+                    WorkBuddyHelper-source.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: |
+            WorkBuddyHelper-windows-amd64.exe
+            WorkBuddyHelper-linux-amd64
+            WorkBuddyHelper-linux-arm64
+            WorkBuddyHelper-source.zip
+            SHA256SUMS.txt
+
+      - name: Prepare release body
+        run: |
+          NOTES=".github/release-notes/v${{ steps.version.outputs.version }}.md"
+          if [ -f "$NOTES" ]; then
+            cp "$NOTES" RELEASE_BODY.md
+            echo "使用版本说明：$NOTES"
+          else
+            {
+              echo "## WorkBuddy Helper v${{ steps.version.outputs.version }}"
+              echo
+              echo "腾讯 WorkBuddy / CodeBuddy 多账户签到与积分看板。"
+              echo
+              echo "详见仓库 README 的[更新日志](https://github.com/${{ github.repository }}#更新日志)。"
+            } > RELEASE_BODY.md
+            echo "未找到 $NOTES，使用通用说明"
+          fi
+          cat RELEASE_BODY.md
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: WorkBuddy Helper v${{ steps.version.outputs.version }}
+          body_path: RELEASE_BODY.md
+          files: |
+            WorkBuddyHelper-windows-amd64.exe
+            WorkBuddyHelper-linux-amd64
+            WorkBuddyHelper-linux-arm64
+            WorkBuddyHelper-source.zip
+            SHA256SUMS.txt
+          generate_release_notes: false
+
+  build-image:
+    name: 构建并推送多架构镜像
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "resolved version: $VERSION"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
