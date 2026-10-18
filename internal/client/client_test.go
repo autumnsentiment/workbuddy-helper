@@ -257,6 +257,30 @@ func TestDailyCheckinAlreadyHTTPErrorKeepsBusinessCode(t *testing.T) {
 	}
 }
 
+func TestDomesticRequestsUseCurrentWorkBuddyIdentity(t *testing.T) {
+	var got http.Header
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		got = r.Header.Clone()
+		return response(http.StatusOK, `{"code":0,"data":{}}`), nil
+	})
+	if err := c.DailyCheckin(&model.Account{AccessToken: "at", UID: "u1"}); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"User-Agent":          ClientUA,
+		"X-Product":           "SaaS",
+		"X-IDE-Type":          CNClientName,
+		"X-IDE-Name":          CNClientName,
+		"X-IDE-Version":       CNClientVersion,
+		"X-Requested-With":    "XMLHttpRequest",
+		"x-codebuddy-request": "1",
+	} {
+		if got.Get(key) != want {
+			t.Fatalf("%s=%q, want %q", key, got.Get(key), want)
+		}
+	}
+}
+
 func TestRefreshDoesNotFollowRedirect(t *testing.T) {
 	called := 0
 	c := testClient(func(r *http.Request) (*http.Response, error) {

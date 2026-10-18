@@ -30,7 +30,11 @@ const (
 	GlobalBase    = "https://www.workbuddy.ai"
 	// 国际版 billing 与国内版一样挂在 codebuddy 域（逆向自国际版客户端，实测确认）
 	GlobalBillingBase = "https://www.codebuddy.ai"
-	ClientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
+	// WorkBuddy CN 5.8.3.41334564 ships CLI 2.161.0.
+	ClientUA        = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	CNClientVersion = "5.8.3"
+	CNClientName    = "WorkBuddy"
+	legacyIntlUA    = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 	// 国际版桌面客户端特征（逆向自 WorkBuddy AI 5.5.2 主进程 CLIENT_INFO_* 注入与
 	// CLI UserAgentHttpInterceptor 拼装算法，实测 plans-usage 按此识别客户端）
@@ -554,8 +558,19 @@ func commonHeaders(req *http.Request, origin string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", ClientUA)
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	if strings.Contains(strings.ToLower(origin), "workbuddy.ai") {
+		// Preserve the existing international login/refresh identity. Domestic
+		// header changes must not alter the separate international flow.
+		req.Header.Set("User-Agent", legacyIntlUA)
+	} else {
+		req.Header.Set("User-Agent", ClientUA)
+		req.Header.Set("X-Product", "SaaS")
+		req.Header.Set("X-IDE-Type", CNClientName)
+		req.Header.Set("X-IDE-Name", CNClientName)
+		req.Header.Set("X-IDE-Version", CNClientVersion)
+		req.Header.Set("x-codebuddy-request", "1")
+	}
 }
 
 func authHeaders(req *http.Request, a *model.Account, billing bool) {
@@ -564,9 +579,14 @@ func authHeaders(req *http.Request, a *model.Account, billing bool) {
 		origin = "https://www.workbuddy.ai"
 	}
 	if billing {
+		if isGlobalAccount(a) {
+			req.Header.Set("Accept", "application/json")
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			// Domestic billing uses the same current desktop identity as chat.
+			commonHeaders(req, origin)
+		}
 		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
 	} else {
 		commonHeaders(req, origin)
 		req.Header.Set("Authorization", "Bearer "+a.AccessToken)
@@ -1161,6 +1181,13 @@ func conversationHeaders(req *http.Request, a *model.Account) {
 		req.Header.Set("X-Domain", a.Domain)
 	}
 	req.Header.Set("X-Product", "SaaS")
+	if !isGlobalAccount(a) {
+		req.Header.Set("X-IDE-Type", CNClientName)
+		req.Header.Set("X-IDE-Name", CNClientName)
+		req.Header.Set("X-IDE-Version", CNClientVersion)
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("x-codebuddy-request", "1")
+	}
 	req.Header.Set("X-Request-ID", strings.ReplaceAll(newUUID(), "-", ""))
 	if isGlobalAccount(a) {
 		req.Header.Set("User-Agent", IntlClientUA)
@@ -1576,6 +1603,13 @@ func chatHeaders(req *http.Request, a *model.Account) {
 		req.Header.Set("X-Domain", a.Domain)
 	}
 	req.Header.Set("X-Product", "SaaS")
+	if !isGlobalAccount(a) {
+		req.Header.Set("X-IDE-Type", CNClientName)
+		req.Header.Set("X-IDE-Name", CNClientName)
+		req.Header.Set("X-IDE-Version", CNClientVersion)
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("x-codebuddy-request", "1")
+	}
 	// 会话维度头（复刻 CLI axiosToFetchAdapter）：conversation/request/message ID 均为
 	// 客户端本地生成 UUID，服务端按此登记会话；缺失时请求不被计为有效活跃会话
 	req.Header.Set("X-Conversation-ID", newUUID())
